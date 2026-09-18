@@ -1,0 +1,7 @@
+/target
+**/*.rs.bk
+.env
+data/*.jar
+data/*.json
+!data/.gitkeep
+.freebuff

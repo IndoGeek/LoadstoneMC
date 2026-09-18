@@ -1,0 +1,21 @@
+[package]
+name = "loadstone-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "loadstone"
+path = "src/main.rs"
+
+[dependencies]
+loadstone-protocol.workspace = true
+loadstone-net.workspace = true
+loadstone-world.workspace = true
+loadstone-registry.workspace = true
+
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+clap = { version = "4", features = ["derive"] }

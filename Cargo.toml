@@ -1,0 +1,42 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/loadstone-protocol",
+    "crates/loadstone-net",
+    "crates/loadstone-world",
+    "crates/loadstone-registry",
+    "crates/loadstone-server",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+
+[workspace.dependencies]
+loadstone-protocol = { path = "crates/loadstone-protocol" }
+loadstone-net = { path = "crates/loadstone-net" }
+loadstone-world = { path = "crates/loadstone-world" }
+loadstone-registry = { path = "crates/loadstone-registry" }
+
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "sync", "time"] }
+flate2 = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "2"
+anyhow = "1"
+
+aes = "0.8"
+rsa = "0.9"
+rand = "0.8"
+sha1 = "0.10"
+ureq = "2"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
