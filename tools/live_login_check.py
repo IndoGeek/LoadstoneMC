@@ -6,7 +6,7 @@ verified over a real socket instead of in-process: server list ping, login
 (offline and online modes, including the RSA key exchange with AES/CFB8
 streaming and a Mojang-style `hasJoined` lookup against a local mock session
 server), the full Configuration handshake, and the Play state where the client
-spawns onto the flat world, chat is echoed back, and block edits (dig/place)
+spawns onto generated terrain, chat is echoed back, and block edits (dig/place)
 are acknowledged with block changes. Also covers the two
 online-mode refusals: an unverified account, and a key exchange that does not
 echo the verify token.
@@ -23,11 +23,15 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import glob
 import os
+import shutil
+import signal
 import socket
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -338,20 +342,49 @@ def complete_configuration(client: Client) -> int:
             raise AssertionError("bad configuration packet")
 
 
-def drive_into_play(client: Client, name: str, expected_entity_id: int | None = 0) -> int:
+def parse_chunk_heightmaps(body: bytes) -> tuple[int, int, tuple[int, ...]]:
+    """Reads a map_chunk packet's WORLD_SURFACE heightmap: returns the chunk
+    coordinates and the 256 per-column surface heights."""
+    chunk_x = struct.unpack(">i", body[0:4])[0]
+    chunk_z = struct.unpack(">i", body[4:8])[0]
+    count, consumed = read_varint(body, 8)
+    size = 8 + consumed
+    world_surface: tuple[int, ...] = ()
+    for _ in range(count):
+        map_type, consumed = read_varint(body, size)
+        size += consumed
+        length, consumed = read_varint(body, size)
+        size += consumed
+        words = struct.unpack(f">{length}q", body[size : size + 8 * length])
+        size += 8 * length
+        if map_type == 1:  # WORLD_SURFACE
+            heights = []
+            for word in words:
+                word &= 0xFFFFFFFFFFFFFFFF
+                for shift in range(0, 64, 9):
+                    heights.append(word >> shift & 0x1FF)
+            world_surface = tuple(heights[:256])
+    return chunk_x, chunk_z, world_surface
+
+
+def drive_into_play(client: Client, name: str, expected_entity_id: int | None = 0):
     """Consume the spawn sequence of the Play state: the login packet, the 3x3
     chunk batch, the first teleport and the health/welcome line. Acknowledges
     the chunk batch, confirms the teleport and answers keep-alives like a
-    vanilla client would. Returns the entity id from the login packet."""
+    vanilla client would. Returns `(entity_id, position)`."""
     chunks = 0
     login = position = health = welcome = None
     acked = False
+    surfaces = {}
     while chunks < 9 or None in (login, position, health, welcome):
         packet_id, body = client.read_packet()
         if packet_id == PKT_PLAY_LOGIN:
             login = body
         elif packet_id == PKT_PLAY_MAP_CHUNK:
             chunks += 1
+            chunk_x, chunk_z, heights = parse_chunk_heightmaps(body)
+            if heights:
+                surfaces[(chunk_x, chunk_z)] = heights
         elif packet_id == PKT_PLAY_CHUNK_BATCH_START:
             pass
         elif packet_id == PKT_PLAY_POSITION:
@@ -380,10 +413,17 @@ def drive_into_play(client: Client, name: str, expected_entity_id: int | None = 
         check(entity_id == expected_entity_id,
               f"play login assigns entity id {expected_entity_id}", str(entity_id))
 
+    # Generated terrain, not one flat template: the 3x3 heightmaps must differ.
+    unique_surfaces = {heights for heights in surfaces.values()}
+    check(len(surfaces) == 9, "all nine chunks carry a heightmap", str(len(surfaces)))
+    check(len(unique_surfaces) > 1, "chunk heightmaps differ (generated terrain)")
+
     # teleport: varint id, then three doubles; little-endian for the f32 health below.
     pos = struct.unpack(">3d", position[1:25])
     teleport_flags = struct.unpack(">i", position[-4:])[0]
-    check(pos == (8.5, 65.0, 8.5), "the first teleport lands on spawn", str(pos))
+    check((pos[0], pos[2]) == (8.5, 8.5), "the first teleport lands on spawn x/z", str(pos))
+    check(-55.0 <= pos[1] <= 121.0 and float(pos[1]).is_integer(),
+          "the player stands on the generated surface", str(pos))
     check(teleport_flags == 0, "the first teleport is absolute", str(teleport_flags))
 
     health_value = struct.unpack(">f", health[:4])[0]
@@ -391,7 +431,7 @@ def drive_into_play(client: Client, name: str, expected_entity_id: int | None = 
 
     check(name.encode() in welcome and b"Welcome" in welcome,
           "a chat welcome greets the player by name")
-    return entity_id
+    return entity_id, pos
 
 
 def chat_echo(client: Client, name: str, message: str) -> None:
@@ -419,14 +459,17 @@ def chat_echo(client: Client, name: str, message: str) -> None:
             raise AssertionError("kicked in play")
 
 
-def block_round_trip(client: Client) -> None:
-    """Dig the grass below the spawn and place a cobblestone on its empty spot;
-    the server must answer each with a block_change packet matching the new
-    state. The flat template has grass at y=64 and bedrock at y=-64."""
-    # Break the grass block the spawn stands on (8, 64, 8).
+def block_round_trip(client: Client, surface_y: int) -> None:
+    """Dig the surface block below the spawn and place a cobblestone on its
+    empty spot; the server must answer each with a block_change packet matching
+    the new state. `surface_y` is the generated grass block the player stands on."""
+    # Break the grass block the spawn stands on.
     client.write_packet(
         PKT_PLAY_BLOCK_DIG,
-        write_varint(2) + struct.pack(">q", pack_position(8, 64, 8)) + bytes([1]) + write_varint(1),
+        write_varint(2)
+        + struct.pack(">q", pack_position(8, surface_y, 8))
+        + bytes([1])
+        + write_varint(1),
     )
     packet_id, body = client.read_packet()
     if not check(packet_id == PKT_PLAY_BLOCK_CHANGE, "digging answers with a block change",
@@ -435,19 +478,19 @@ def block_round_trip(client: Client) -> None:
 
     (location,) = struct.unpack(">q", body[:8])
     state, _ = read_varint(body, 8)
-    check(location == pack_position(8, 64, 8), "the broken block is the grass at (8,64,8)",
-          hex(location))
+    check(location == pack_position(8, surface_y, 8),
+          f"the broken block is the surface at (8,{surface_y},8)", hex(location))
     check(state == 0, "a dug block becomes air", str(state))
 
     # Place on the top face of the now-empty spot: the block lands above it.
     client.write_packet(
         PKT_PLAY_BLOCK_PLACE,
-        write_varint(0)                                   # hand
-        + struct.pack(">q", pack_position(8, 64, 8))      # clicked location
-        + write_varint(1)                                 # top face
-        + struct.pack(">3f", 0.5, 1.0, 0.5)               # cursor
-        + b"\x00\x00"                                    # inside block, world border
-        + write_varint(2),                               # sequence
+        write_varint(0)                                       # hand
+        + struct.pack(">q", pack_position(8, surface_y, 8))   # clicked location
+        + write_varint(1)                                     # top face
+        + struct.pack(">3f", 0.5, 1.0, 0.5)                   # cursor
+        + b"\x00\x00"                                        # inside block, world border
+        + write_varint(2),                                   # sequence
     )
     packet_id, body = client.read_packet()
     if not check(packet_id == PKT_PLAY_BLOCK_CHANGE,
@@ -456,7 +499,8 @@ def block_round_trip(client: Client) -> None:
 
     (location,) = struct.unpack(">q", body[:8])
     state, _ = read_varint(body, 8)
-    check(location == pack_position(8, 65, 8), "the placed block lands at (8,65,8)", hex(location))
+    check(location == pack_position(8, surface_y + 1, 8),
+          f"the placed block lands at (8,{surface_y + 1},8)", hex(location))
     check(state == 14, "a placed block becomes cobblestone", str(state))
 
 
@@ -532,7 +576,7 @@ def check_two_players(host: str, port: int) -> None:
         read_login_success(alice)
         alice.write_packet(PKT_LOGIN_ACKNOWLEDGED)
         complete_configuration(alice)
-        alice_entity = drive_into_play(alice, "Alice", expected_entity_id=None)
+        alice_entity, _ = drive_into_play(alice, "Alice", expected_entity_id=None)
 
         handshake(bob, host, port, 2)
         bob_uuid = login_start(bob, "Bob")
@@ -540,7 +584,7 @@ def check_two_players(host: str, port: int) -> None:
         read_login_success(bob)
         bob.write_packet(PKT_LOGIN_ACKNOWLEDGED)
         complete_configuration(bob)
-        bob_entity_login = drive_into_play(bob, "Bob", expected_entity_id=None)
+        bob_entity_login, bob_position = drive_into_play(bob, "Bob", expected_entity_id=None)
 
         check(alice_entity != bob_entity_login,
               "players receive distinct entity ids", f"{alice_entity} == {bob_entity_login}")
@@ -556,14 +600,15 @@ def check_two_players(host: str, port: int) -> None:
         synced = await_sync(alice, bob_entity)
         check(synced == (9.0, 65.0, 8.5), "movement reaches the other player", str(synced))
 
-        # Bob's block edit is shared with Alice. (7,64,8) is untouched grass.
+        # Bob's block edit is shared with Alice. (7, surface, 8) is untouched grass.
+        surface = int(bob_position[1]) - 1
         bob.write_packet(
             PKT_PLAY_BLOCK_DIG,
-            write_varint(2) + struct.pack(">q", pack_position(7, 64, 8))
+            write_varint(2) + struct.pack(">q", pack_position(7, surface, 8))
             + bytes([1]) + write_varint(1),
         )
         shared = await_block_change(alice)
-        check(shared == pack_position(7, 64, 8),
+        check(shared == pack_position(7, surface, 8),
               "a block edit is shared between players", hex(shared))
 
         # Bob leaves; Alice is told to drop him.
@@ -680,9 +725,9 @@ def check_offline_login(host: str, port: int, name: str) -> None:
         registries = complete_configuration(client)
         check(registries == 23, "all synchronized registries are delivered",
               f"{registries} registries")
-        drive_into_play(client, name)
+        _, position = drive_into_play(client, name)
         chat_echo(client, name, "hello from live check")
-        block_round_trip(client)
+        block_round_trip(client, int(position[1]) - 1)
     finally:
         client.close()
 
@@ -735,9 +780,9 @@ def check_online_login(host: str, port: int, name: str, session: "MockSession") 
         registries = complete_configuration(client)
         check(registries == 23, "all synchronized registries are delivered",
               f"{registries} registries")
-        drive_into_play(client, name)
+        _, position = drive_into_play(client, name)
         chat_echo(client, name, "hello from live check")
-        block_round_trip(client)
+        block_round_trip(client, int(position[1]) - 1)
     finally:
         client.close()
 
@@ -901,17 +946,77 @@ def wait_for_port(host: str, port: int, timeout: float = 15.0) -> bool:
 
 
 def spawn_server(binary: str, port: int, motd: str, online: bool, session_url: str | None):
-    command = [binary, "--bind", f"127.0.0.1:{port}", "--motd", motd]
+    """Starts the server on a fixed seed in a throwaway world directory so the
+    checks are reproducible and never touch a real save."""
+    world_dir = tempfile.mkdtemp(prefix="loadstone-live-world-")
+    command = [
+        binary,
+        "--bind", f"127.0.0.1:{port}",
+        "--motd", motd,
+        "--seed", "0",
+        "--world", world_dir,
+        "--save-interval", "0",
+    ]
     if online:
         command += ["--online-mode", "--sessionserver-url", session_url or ""]
     process = subprocess.Popen(
         command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
     )
+    process.loadstone_world_dir = world_dir  # type: ignore[attr-defined]
     if not wait_for_port("127.0.0.1", port):
         process.kill()
         output = process.stdout.read() if process.stdout else ""
+        shutil.rmtree(world_dir, ignore_errors=True)
         raise SystemExit(f"server did not start:\n{output}")
     return process
+
+
+def check_persistence(process: subprocess.Popen) -> None:
+    """Signals the server to save on shutdown, then inspects the Anvil output:
+    a region file holding the generated terrain and the edits made above."""
+    world_dir = getattr(process, "loadstone_world_dir", None)
+    if not check(world_dir is not None, "the server runs with a scratch world directory"):
+        return
+    if not check(process.poll() is None, "the server is still running before shutdown"):
+        return
+
+    process.send_signal(signal.SIGINT)
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        check(False, "the server shuts down on interrupt")
+        process.kill()
+        return
+    check(process.returncode == 0, "the server exits cleanly after saving",
+          str(process.returncode))
+
+    region_dir = os.path.join(world_dir, "region")
+    regions = sorted(glob.glob(os.path.join(region_dir, "*.mca")))
+    if not check(bool(regions), "shutdown wrote an Anvil region file", region_dir):
+        return
+    check(os.path.exists(os.path.join(world_dir, "loadstone.seed")),
+          "the seed sidecar is written next to the regions")
+
+    # The spawn is chunk (0,0), so its payload lives in slot 0 of r.0.0.mca.
+    spawn_region = os.path.join(region_dir, "r.0.0.mca")
+    if not check(os.path.exists(spawn_region), "the spawn region r.0.0.mca is written",
+                 spawn_region):
+        return
+    with open(spawn_region, "rb") as handle:
+        region = handle.read()
+    if not check(len(region) >= 8192, "the region file has an 8 KiB header", str(len(region))):
+        return
+    offset = int.from_bytes(region[0:3], "big")
+    if not check(offset != 0, "the spawn chunk slot points at a payload"):
+        return
+    start = offset * 4096
+    length = int.from_bytes(region[start : start + 4], "big")
+    compression = region[start + 4]
+    payload = zlib.decompress(region[start + 5 : start + 4 + length])
+    check(compression == 2, "region chunks are zlib compressed", str(compression))
+    check(b"DataVersion" in payload, "the saved chunk carries a DataVersion")
+    check(b"minecraft:grass_block" in payload, "the saved chunk holds generated terrain")
+    check(b"minecraft:cobblestone" in payload, "the saved chunk holds a player edit")
 
 
 def main() -> int:
@@ -960,6 +1065,8 @@ def main() -> int:
             check_offline_login(args.host, args.port, args.name)
             check_chunk_streaming(args.host, args.port)
             check_two_players(args.host, args.port)
+            if process is not None:
+                check_persistence(process)
         elif session is not None:
             check_online_login(args.host, args.port, args.mock_name, session)
             check_online_rejection(args.host, args.port, session)
@@ -973,6 +1080,7 @@ def main() -> int:
                 process.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 process.kill()
+            shutil.rmtree(getattr(process, "loadstone_world_dir", ""), ignore_errors=True)
         if session is not None:
             session.stop()
 

@@ -11,60 +11,21 @@
 
 use loadstone_protocol::PacketWriter;
 
-use crate::{Chunk, CHUNK_SIZE_X, CHUNK_SIZE_Z, SECTION_COUNT, SECTION_HEIGHT};
+use crate::{Chunk, CHUNK_SIZE_X, CHUNK_SIZE_Z, SECTION_HEIGHT};
 
 /// Lowest block Y of the overworld.
 pub const MIN_Y: i32 = -64;
 /// Total block height of the overworld.
 pub const WORLD_HEIGHT: i32 = 384;
-/// Vanilla 1.21.11 global block state ids used by the flat world.
+/// Vanilla 1.21.11 global block state ids used by the world.
 pub const BLOCK_AIR: u16 = 0;
+pub const BLOCK_STONE: u16 = 1;
 pub const BLOCK_GRASS_BLOCK: u16 = 9;
 pub const BLOCK_DIRT: u16 = 10;
 pub const BLOCK_COBBLESTONE: u16 = 14;
 pub const BLOCK_BEDROCK: u16 = 85;
-
-/// The flat spawn platform: bedrock at the bottom, dirt filling the middle,
-/// a grass top at world Y 64 (player spawns at Y 65).
-pub const SPAWN_X: f64 = 8.5;
-pub const SPAWN_Z: f64 = 8.5;
-pub const SPAWN_Y: f64 = 65.0;
-pub const GRASS_TOP_Y: i32 = 64;
-
-/// Builds the flat world chunk template centered on `(cx, cz)`. Every column
-/// is identical, so heightmap values are constant (grass top at `GRASS_TOP_Y`).
-pub fn flat_chunk(cx: i32, cz: i32) -> Chunk {
-    let mut chunk = Chunk {
-        pos: crate::ChunkPos { x: cx, z: cz },
-        sections: Vec::with_capacity(SECTION_COUNT),
-    };
-
-    let filled = |state: u16| crate::ChunkSection {
-        block_states: vec![state; CHUNK_SIZE_X * CHUNK_SIZE_Z * SECTION_HEIGHT],
-        non_air_blocks: 4096,
-    };
-
-    for _ in 0..SECTION_COUNT {
-        chunk.sections.push(crate::ChunkSection::default());
-    }
-    chunk.sections[0] = filled(BLOCK_BEDROCK);
-    for section in &mut chunk.sections[1..8] {
-        *section = filled(BLOCK_DIRT);
-    }
-
-    // Top section: a grass cap on layer 0, air above within the section.
-    let mut top = chunk.sections[8].clone();
-    top.block_states = vec![BLOCK_AIR; CHUNK_SIZE_X * CHUNK_SIZE_Z * SECTION_HEIGHT];
-    for z in 0..CHUNK_SIZE_Z {
-        for x in 0..CHUNK_SIZE_X {
-            top.block_states[z * CHUNK_SIZE_X + x] = BLOCK_GRASS_BLOCK;
-        }
-    }
-    top.non_air_blocks = 256;
-    chunk.sections[8] = top;
-
-    chunk
-}
+pub const BLOCK_SAND: u16 = 118;
+pub const BLOCK_GLASS: u16 = 562;
 
 fn index(y: usize, z: usize, x: usize) -> usize {
     (y * CHUNK_SIZE_Z + z) * CHUNK_SIZE_X + x
@@ -176,30 +137,28 @@ pub fn full_sky_light(section_count: usize) -> Vec<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::terrain::TerrainGenerator;
+    use crate::{ChunkPos, SECTION_COUNT};
 
     #[test]
-    fn flat_chunk_has_expected_layout() {
-        let chunk = flat_chunk(0, 0);
+    fn generated_chunk_has_expected_layout() {
+        let chunk = TerrainGenerator::new(0).chunk(ChunkPos { x: 0, z: 0 });
+        let surface = TerrainGenerator::new(0).surface_height(0, 0);
         assert_eq!(chunk.sections.len(), SECTION_COUNT);
-        assert_eq!(chunk.sections[0].block_states[0], BLOCK_BEDROCK);
-        assert_eq!(chunk.sections[7].block_states[0], BLOCK_DIRT);
-        assert_eq!(
-            chunk.sections[8].block_states[index(0, 0, 0)],
-            BLOCK_GRASS_BLOCK
-        );
-        assert_eq!(chunk.sections[8].block_states[index(15, 15, 15)], BLOCK_AIR);
-        assert_eq!(chunk.sections[8].non_air_blocks, 256);
-        assert_eq!(chunk.sections[9].non_air_blocks, 0);
+        assert_eq!(chunk.get_block(0, MIN_Y, 0), BLOCK_BEDROCK);
+        assert_eq!(chunk.get_block(0, surface, 0), BLOCK_GRASS_BLOCK);
+        assert_eq!(chunk.get_block(0, surface + 1, 0), BLOCK_AIR);
     }
 
     #[test]
     fn heightmap_uses_nine_bits_and_thirty_seven_longs() {
-        let chunk = flat_chunk(0, 0);
+        let chunk = TerrainGenerator::new(0).chunk(ChunkPos { x: 0, z: 0 });
         let heights = column_heights(&chunk);
-        assert!(heights.iter().all(|&h| h == 129));
+        assert_eq!(heights.len(), CHUNK_SIZE_X * CHUNK_SIZE_Z);
+        let surface = TerrainGenerator::new(0).surface_height(0, 0);
+        assert_eq!(heights[0], (surface - MIN_Y + 1) as u16);
         let packed = pack_heightmap(&heights, WORLD_HEIGHT);
         assert_eq!(packed.len(), 37);
-        // 129 fits in 9 bits; every word must stay a multiple of 129 << k bits.
     }
 
     #[test]

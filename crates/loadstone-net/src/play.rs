@@ -8,9 +8,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use loadstone_protocol::packets::play::{
     degree_to_angle, pack_position, unpack_position, Abilities, BlockChange, BlockDig, BlockPlace,
     BundleDelimiter, ChatMessage, ChunkBatchFinished, ChunkBatchReceived, ChunkBatchStart,
-    ChunkBlockEntity, ClientPosition, EntityHeadRotation, EntityLook, EntityMetadata, Experience,
-    MapChunk, MovementFlags, PingRequest, PlayKeepAlive, PlayKeepAliveResponse, PlayLogin,
-    PlayPong, PlayPongResponse, PlayerInfoEntry, PlayerInfoUpdate, PlayerLook, PlayerPosition,
+    ClientPosition, EntityHeadRotation, EntityLook, EntityMetadata, Experience, MapChunk,
+    MovementFlags, PingRequest, PlayKeepAlive, PlayKeepAliveResponse, PlayLogin, PlayPong,
+    PlayPongResponse, PlayerInfoEntry, PlayerInfoUpdate, PlayerLook, PlayerPosition,
     PlayerPositionLook, PlayerRemove, RemoveEntities, SetChunkCacheCenter, SpawnEntity, SpawnInfo,
     SpawnPosition, SyncEntityPosition, SystemChat, TeleportConfirm, UnloadChunk, UpdateHealth,
     UpdateTime,
@@ -18,6 +18,7 @@ use loadstone_protocol::packets::play::{
 use loadstone_protocol::Nbt;
 use loadstone_protocol::{Packet, PacketReader, PacketWriter};
 use loadstone_world::encode::{self, BLOCK_AIR, BLOCK_COBBLESTONE};
+use loadstone_world::{Chunk, ChunkPos};
 use tokio::sync::mpsc;
 use tracing::{debug, info};
 use uuid::Uuid;
@@ -78,12 +79,41 @@ fn visible_chunks(center_x: i32, center_z: i32, radius: i32) -> Vec<(i32, i32)> 
     chunks
 }
 
-/// Encodes the shared flat chunk at `(x, z)` by retagging the prebuilt template.
-fn encode_map_chunk(template: &MapChunk, x: i32, z: i32) -> Vec<u8> {
-    let mut chunk = template.clone();
-    chunk.x = x;
-    chunk.z = z;
-    encode_body(&chunk)
+/// Builds the `map_chunk` packet for a generated world chunk.
+fn build_map_chunk(chunk: &Chunk, x: i32, z: i32, biome_id: u32) -> MapChunk {
+    let heights = encode::column_heights(chunk);
+    let heightmap = encode::pack_heightmap(&heights, encode::WORLD_HEIGHT);
+    MapChunk {
+        x,
+        z,
+        heightmaps: vec![
+            (HEIGHTMAP_WORLD_SURFACE, heightmap.clone()),
+            (HEIGHTMAP_MOTION_BLOCKING, heightmap.clone()),
+            (HEIGHTMAP_MOTION_BLOCKING_NO_LEAVES, heightmap),
+        ],
+        chunk_data: encode::encode_chunk_column(chunk, biome_id),
+        block_entities: Vec::new(),
+        sky_light_mask: vec![((1 << 24) - 1) as i64],
+        block_light_mask: Vec::new(),
+        empty_sky_light_mask: Vec::new(),
+        empty_block_light_mask: Vec::new(),
+        sky_light: encode::full_sky_light(24),
+        block_light: Vec::new(),
+    }
+}
+
+/// Encodes the `map_chunk` packets for the given chunk columns, generating and
+/// caching them in the shared world first. The lock is held only for the
+/// encode, never across an await.
+fn encode_chunks(config: &ConnectionConfig, coords: &[(i32, i32)], biome_id: u32) -> Vec<Vec<u8>> {
+    let mut world = config.world.lock().unwrap();
+    coords
+        .iter()
+        .map(|&(cx, cz)| {
+            let chunk = world.chunk(ChunkPos { x: cx, z: cz });
+            encode_body(&build_map_chunk(chunk, cx, cz, biome_id))
+        })
+        .collect()
 }
 
 /// A snapshot of a player who was already in the world when a newcomer joined.
@@ -110,6 +140,7 @@ pub async fn play_phase(
     config: &ConnectionConfig,
 ) -> Result<(), NetError> {
     let (out, rx) = mpsc::unbounded_channel();
+    let spawn = config.world.lock().unwrap().spawn();
 
     let (entity_id, existing) = {
         let mut state = config.state.lock().unwrap();
@@ -120,9 +151,9 @@ pub async fn play_phase(
             crate::connection::SharedPlayer {
                 entity_id,
                 name: username.to_string(),
-                x: encode::SPAWN_X,
-                y: encode::SPAWN_Y,
-                z: encode::SPAWN_Z,
+                x: spawn.0,
+                y: spawn.1,
+                z: spawn.2,
                 yaw: 0.0,
                 pitch: 0.0,
                 out,
@@ -146,7 +177,7 @@ pub async fn play_phase(
         (entity_id, existing)
     };
 
-    let result = run_play(conn, uuid, username, config, entity_id, existing, rx).await;
+    let result = run_play(conn, uuid, username, config, entity_id, existing, rx, spawn).await;
     leave_world(config, uuid, entity_id);
     result
 }
@@ -160,6 +191,7 @@ async fn run_play(
     entity_id: i32,
     existing: Vec<ExistingPlayer>,
     rx: mpsc::UnboundedReceiver<(i32, Vec<u8>)>,
+    spawn: (f64, f64, f64),
 ) -> Result<(), NetError> {
     let dimension_id =
         loadstone_registry::runtime_id("minecraft:dimension_type", "minecraft:overworld")
@@ -171,30 +203,6 @@ async fn run_play(
         NetError::Internal("minecraft:plains missing from synced registries".into())
     })?;
     let biome_id = biome_id as u32;
-
-    // Every chunk in the flat demo world is identical, so build one template
-    // and only retag its coordinates when streaming individual chunks.
-    let world_origin = encode::flat_chunk(0, 0);
-    let heights = encode::column_heights(&world_origin);
-    let heightmap_data = encode::pack_heightmap(&heights, encode::WORLD_HEIGHT);
-    let chunk_data = encode::encode_chunk_column(&world_origin, biome_id);
-    let chunk_template = MapChunk {
-        x: 0,
-        z: 0,
-        heightmaps: vec![
-            (HEIGHTMAP_WORLD_SURFACE, heightmap_data.clone()),
-            (HEIGHTMAP_MOTION_BLOCKING, heightmap_data.clone()),
-            (HEIGHTMAP_MOTION_BLOCKING_NO_LEAVES, heightmap_data.clone()),
-        ],
-        chunk_data,
-        block_entities: vec![] as Vec<ChunkBlockEntity>,
-        sky_light_mask: vec![((1 << 24) - 1) as i64],
-        block_light_mask: Vec::new(),
-        empty_sky_light_mask: Vec::new(),
-        empty_block_light_mask: Vec::new(),
-        sky_light: encode::full_sky_light(24),
-        block_light: Vec::new(),
-    };
 
     // 1. Login: dimension, spawn info and world rendering settings.
     let login = PlayLogin {
@@ -214,7 +222,7 @@ async fn run_play(
             gamemode: 0, // survival
             previous_gamemode: 255,
             is_debug: false,
-            is_flat: true,
+            is_flat: false,
             death: None,
             portal_cooldown: 0,
             // The vanilla capture showed a surprising -63 in this field during
@@ -230,15 +238,16 @@ async fn run_play(
     // before leaving the "downloading terrain" screen.
     let spawn_pos = SpawnPosition {
         dimension_name: "minecraft:overworld".to_string(),
-        position: pack_position(0, encode::GRASS_TOP_Y + 1, 0),
+        position: pack_position(0, spawn.1.floor() as i32, 0),
         yaw: 0.0,
         pitch: 0.0,
     };
     let body = encode_body(&spawn_pos);
     conn.write_packet(SpawnPosition::ID, &body).await?;
 
-    let spawn_center = chunk_of(encode::SPAWN_X, encode::SPAWN_Z);
+    let spawn_center = chunk_of(spawn.0, spawn.2);
     let initial = visible_chunks(spawn_center.0, spawn_center.1, VIEW_DISTANCE);
+    let initial_bodies = encode_chunks(config, &initial, biome_id);
 
     let body = encode_body(&SetChunkCacheCenter {
         chunk_x: spawn_center.0,
@@ -248,9 +257,8 @@ async fn run_play(
 
     let body = encode_body(&ChunkBatchStart);
     conn.write_packet(ChunkBatchStart::ID, &body).await?;
-    for &(cx, cz) in &initial {
-        let body = encode_map_chunk(&chunk_template, cx, cz);
-        conn.write_packet(MapChunk::ID, &body).await?;
+    for body in &initial_bodies {
+        conn.write_packet(MapChunk::ID, body).await?;
     }
     // The client acknowledges the batch; the finished packet lifts the tunnel.
     loop {
@@ -267,14 +275,7 @@ async fn run_play(
     let loaded_chunks: HashSet<(i32, i32)> = initial.into_iter().collect();
 
     // 3. Place the player at the spawn point and introduce them in the tab list.
-    let teleport = ClientPosition::absolute(
-        0,
-        encode::SPAWN_X,
-        encode::SPAWN_Y,
-        encode::SPAWN_Z,
-        0.0,
-        0.0,
-    );
+    let teleport = ClientPosition::absolute(0, spawn.0, spawn.1, spawn.2, 0.0, 0.0);
     let body = encode_body(&teleport);
     conn.write_packet(ClientPosition::ID, &body).await?;
 
@@ -284,7 +285,7 @@ async fn run_play(
     // 4. Introduce the players who were already here, in one atomic bundle.
     send_existing_players(&mut conn, &existing).await?;
     // And tell everyone else that this player joined.
-    broadcast_join(config, uuid, entity_id, username);
+    broadcast_join(config, uuid, entity_id, username, spawn);
 
     // 5. Core gameplay state the client expects right after joining.
     let abilities = Abilities {
@@ -344,7 +345,8 @@ async fn run_play(
         uuid,
         username,
         config,
-        chunk_template,
+        biome_id,
+        spawn,
         loaded_chunks,
         rx,
     )
@@ -408,23 +410,21 @@ fn skin_metadata(entity_id: i32) -> Vec<u8> {
 }
 
 /// Pushes this player's tab entry, spawn and metadata to every other player.
-fn broadcast_join(config: &ConnectionConfig, uuid: Uuid, entity_id: i32, username: &str) {
-    let spawn = SpawnEntity::player(
-        entity_id,
-        uuid,
-        encode::SPAWN_X,
-        encode::SPAWN_Y,
-        encode::SPAWN_Z,
-        0.0,
-        0.0,
-    );
+fn broadcast_join(
+    config: &ConnectionConfig,
+    uuid: Uuid,
+    entity_id: i32,
+    username: &str,
+    spawn: (f64, f64, f64),
+) {
+    let entity = SpawnEntity::player(entity_id, uuid, spawn.0, spawn.1, spawn.2, 0.0, 0.0);
     let frames = [
         (BundleDelimiter::ID, encode_body(&BundleDelimiter)),
         (
             PlayerInfoUpdate::ID,
             encode_body(&player_info_add(uuid, username)),
         ),
-        (SpawnEntity::ID, encode_body(&spawn)),
+        (SpawnEntity::ID, encode_body(&entity)),
         (EntityMetadata::ID, skin_metadata(entity_id)),
         (BundleDelimiter::ID, encode_body(&BundleDelimiter)),
     ];
@@ -500,18 +500,20 @@ fn record_movement(
 /// The in-game packet loop. Reads from the client, replies to keep-alives and
 /// pings, applies movement/block edits to the shared world, streams chunks when
 /// the player crosses a chunk border, and flushes packets pushed by others.
+#[allow(clippy::too_many_arguments)]
 async fn play_loop(
     conn: &mut Connection,
     uuid: Uuid,
     username: &str,
     config: &ConnectionConfig,
-    chunk_template: MapChunk,
+    biome_id: u32,
+    spawn: (f64, f64, f64),
     mut loaded_chunks: HashSet<(i32, i32)>,
     mut rx: mpsc::UnboundedReceiver<(i32, Vec<u8>)>,
 ) -> Result<(), NetError> {
     let mut keep_alive_id: i64 = 1;
     let mut deadline = tokio::time::Instant::now() + KEEP_ALIVE_PERIOD;
-    let mut center = chunk_of(encode::SPAWN_X, encode::SPAWN_Z);
+    let mut center = chunk_of(spawn.0, spawn.2);
 
     loop {
         tokio::select! {
@@ -534,7 +536,8 @@ async fn play_loop(
                     if new_center != center {
                         stream_chunks(
                             conn,
-                            &chunk_template,
+                            config,
+                            biome_id,
                             &mut loaded_chunks,
                             new_center,
                         )
@@ -554,7 +557,8 @@ async fn play_loop(
 /// announced first so the client knows the new centre.
 async fn stream_chunks(
     conn: &mut Connection,
-    template: &MapChunk,
+    config: &ConnectionConfig,
+    biome_id: u32,
     loaded: &mut HashSet<(i32, i32)>,
     center: (i32, i32),
 ) -> Result<(), NetError> {
@@ -572,11 +576,11 @@ async fn stream_chunks(
         .collect();
 
     if !to_load.is_empty() {
+        let bodies = encode_chunks(config, &to_load, biome_id);
         let body = encode_body(&ChunkBatchStart);
         conn.write_packet(ChunkBatchStart::ID, &body).await?;
-        for &(cx, cz) in &to_load {
-            let body = encode_map_chunk(template, cx, cz);
-            conn.write_packet(MapChunk::ID, &body).await?;
+        for body in &bodies {
+            conn.write_packet(MapChunk::ID, body).await?;
         }
         let body = encode_body(&ChunkBatchFinished {
             batch_size: to_load.len() as i32,

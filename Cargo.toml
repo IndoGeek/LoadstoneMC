@@ -20,7 +20,7 @@ loadstone-net = { path = "crates/loadstone-net" }
 loadstone-world = { path = "crates/loadstone-world" }
 loadstone-registry = { path = "crates/loadstone-registry" }
 
-tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "sync", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "sync", "time", "signal"] }
 flate2 = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

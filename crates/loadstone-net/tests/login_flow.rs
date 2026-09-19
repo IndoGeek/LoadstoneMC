@@ -32,6 +32,7 @@ use loadstone_protocol::packets::play::{
 use loadstone_protocol::packets::Handshake;
 use loadstone_protocol::write_varint;
 use loadstone_protocol::{Packet, PacketReader, PROTOCOL_VERSION};
+use loadstone_world::terrain::TerrainGenerator;
 use rsa::pkcs8::DecodePublicKey;
 use rsa::{Pkcs1v15Encrypt, RsaPublicKey};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -415,12 +416,12 @@ impl Client {
     /// Breaks and places single blocks around the spawn, asserting the server
     /// replies with the matching S->C BlockChange packets. Bedrock edits must
     /// receive no answer at all.
-    async fn mutate_world(&mut self) {
+    async fn mutate_world(&mut self, surface_y: i32) {
         // Break the grass block just below the spawn point.
         let mut writer = loadstone_protocol::PacketWriter::new();
         BlockDig {
             status: 2,
-            location: pack_position(8, 64, 8),
+            location: pack_position(8, surface_y, 8),
             face: 1,
             sequence: 1,
         }
@@ -430,14 +431,14 @@ impl Client {
         let (id, body) = self.recv_timed().await;
         assert_eq!(id, BlockChange::ID);
         let change = BlockChange::decode(&mut PacketReader::new(&body)).unwrap();
-        assert_eq!(change.location, pack_position(8, 64, 8));
+        assert_eq!(change.location, pack_position(8, surface_y, 8));
         assert_eq!(change.block_state, 0, "dig should clear the block to air");
 
         // Place a block on the top face of the (now air) spot.
         let mut writer = loadstone_protocol::PacketWriter::new();
         BlockPlace {
             hand: 0,
-            location: pack_position(8, 64, 8),
+            location: pack_position(8, surface_y, 8),
             direction: 1,
             cursor_x: 0.5,
             cursor_y: 1.0,
@@ -452,7 +453,7 @@ impl Client {
         let (id, body) = self.recv_timed().await;
         assert_eq!(id, BlockChange::ID);
         let change = BlockChange::decode(&mut PacketReader::new(&body)).unwrap();
-        assert_eq!(change.location, pack_position(8, 65, 8));
+        assert_eq!(change.location, pack_position(8, surface_y + 1, 8));
         assert_eq!(change.block_state, 14, "place should set cobblestone");
 
         // Bedrock is unbreakable: expect radio silence from the server.
@@ -608,6 +609,11 @@ fn base_config(online_mode: bool) -> ConnectionConfig {
     }
 }
 
+/// The generated surface block Y at the default spawn (seed 0, block 8,8).
+fn spawn_surface_y() -> i32 {
+    TerrainGenerator::new(0).surface_height(8, 8)
+}
+
 /// Drives one offline client through login, configuration and into Play.
 async fn offline_join(addr: &str, name: &str) -> (Client, Uuid, PlaySnapshot) {
     let mut client = Client::connect(addr).await;
@@ -719,13 +725,13 @@ async fn offline_login_reaches_play_state() {
     );
     assert_eq!(snapshot.login.world_state.gamemode, 0);
     assert_eq!(snapshot.login.world_state.previous_gamemode, 255);
-    assert!(snapshot.login.world_state.is_flat);
+    assert!(!snapshot.login.world_state.is_flat);
     assert!(!snapshot.login.world_state.is_debug);
     assert_eq!(snapshot.login.world_state.hashed_seed, 0);
     assert_eq!(snapshot.login.world_state.sea_level, 63);
     assert_eq!(snapshot.login.world_state.portal_cooldown, 0);
 
-    // 3x3 world around (0,0): every chunk centres on the same flat template.
+    // 3x3 generated world around (0,0).
     assert!(snapshot.chunks.len() == 9);
     let (x_min, x_max) = snapshot
         .chunks
@@ -744,11 +750,24 @@ async fn offline_login_reaches_play_state() {
     assert!(world_surface.1.len() == 37);
     assert!(snapshot.batch.batch_size == 9);
 
-    // The platform spawn: world spawn (0, 65, 0), then player at (8.5, 65, 8.5).
+    // Real terrain, not a flat template: the heightmaps of the 3x3 view must
+    // not all be identical.
+    assert!(
+        snapshot
+            .chunks
+            .iter()
+            .map(|c| c.heightmaps[0].1.clone())
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+            > 1,
+        "generated chunks should differ"
+    );
+
+    // The player spawns standing on the generated surface at (8.5, surface+1, 8.5).
     assert_eq!(snapshot.spawn.dimension_name, "minecraft:overworld");
     assert_eq!(snapshot.position.teleport_id, 0);
     assert_eq!(snapshot.position.x, 8.5);
-    assert_eq!(snapshot.position.y, 65.0);
+    assert_eq!(snapshot.position.y, f64::from(spawn_surface_y() + 1));
     assert_eq!(snapshot.position.z, 8.5);
     assert_eq!(snapshot.position.flags, 0);
 
@@ -762,7 +781,7 @@ async fn offline_login_reaches_play_state() {
     assert!(wire.contains("Alice"), "got: {wire}");
 
     // The world is mutable: dig a block, place one back, and confirm edits echo.
-    client.mutate_world().await;
+    client.mutate_world(spawn_surface_y()).await;
 
     // The client is dropped at the end of this function, so the server can exit.
     drop(client);
@@ -804,17 +823,18 @@ async fn two_players_share_the_world() {
     assert!(sync.on_ground);
 
     // Bob breaks a block: he gets the authoritative echo and Alice sees it too.
-    bob.dig_block(8, 64, 8, 1).await;
+    let surface = spawn_surface_y();
+    bob.dig_block(8, surface, 8, 1).await;
     let (id, body) = bob.next_event().await;
     assert_eq!(id, BlockChange::ID);
     let echo = BlockChange::decode(&mut PacketReader::new(&body)).unwrap();
-    assert_eq!(echo.location, pack_position(8, 64, 8));
+    assert_eq!(echo.location, pack_position(8, surface, 8));
     assert_eq!(echo.block_state, 0);
 
     let (id, body) = alice.next_event().await;
     assert_eq!(id, BlockChange::ID, "expected the shared block change");
     let shared = BlockChange::decode(&mut PacketReader::new(&body)).unwrap();
-    assert_eq!(shared.location, pack_position(8, 64, 8));
+    assert_eq!(shared.location, pack_position(8, surface, 8));
     assert_eq!(shared.block_state, 0);
 
     // Bob disconnects: Alice is told to remove the tab entry and the entity.
@@ -918,7 +938,7 @@ async fn online_login_negotiates_encryption_and_session() {
     let snapshot = client.enter_play(play_uuid).await;
     assert_eq!(snapshot.position.x, 8.5);
     assert_eq!(snapshot.health.health, 20.0);
-    client.mutate_world().await;
+    client.mutate_world(spawn_surface_y()).await;
 
     drop(client);
     tokio::time::timeout(Duration::from_secs(5), server)
