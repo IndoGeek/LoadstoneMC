@@ -1,6 +1,7 @@
 //! End-to-end login tests: a simulated vanilla client handshakes, logs in
 //! (offline and online modes), negotiates AES/CFB8 encryption and zlib
-//! compression, and verifies the server's Login Success.
+//! compression, verifies the server's Login Success, and drives the whole
+//! Configuration state to its acknowledgement.
 //!
 //! Online mode uses a local mock "Mojang session server" so no real accounts
 //! or internet are required.
@@ -12,6 +13,10 @@ use std::time::Duration;
 
 use loadstone_net::auth::compute_server_id;
 use loadstone_net::{run_connection, Cfb8, ConnectionConfig};
+use loadstone_protocol::packets::configuration::{
+    AcknowledgeFinishConfiguration, ClientInformation, ClientboundKnownPacks, CustomPayload,
+    FeatureFlags, FinishConfiguration, RegistryData, ServerboundKnownPacks, UpdateTags,
+};
 use loadstone_protocol::packets::login::{
     EncryptionRequest, EncryptionResponse, LoginAcknowledged, LoginStart, LoginSuccess,
     SetCompression,
@@ -173,6 +178,76 @@ impl Client {
     async fn acknowledged(&mut self) {
         self.send_packet(LoginAcknowledged::ID, &[]).await;
     }
+
+    async fn recv_timed(&mut self) -> (i32, Vec<u8>) {
+        tokio::time::timeout(Duration::from_secs(5), self.recv_packet())
+            .await
+            .expect("timeout waiting for a packet")
+    }
+
+    /// Drive the vanilla Configuration handshake and return the registries the
+    /// server sent, as `(registry id, entry count)` in packet order.
+    async fn complete_configuration(&mut self) -> Vec<(String, usize)> {
+        // The server opens with its brand and feature flags, then offers known packs.
+        let packs = loop {
+            let (id, body) = self.recv_timed().await;
+            if id == CustomPayload::ID || id == FeatureFlags::ID {
+                continue;
+            }
+            assert_eq!(id, ClientboundKnownPacks::ID, "unexpected config packet");
+            break ClientboundKnownPacks::decode(&mut PacketReader::new(&body))
+                .unwrap()
+                .packs;
+        };
+        assert_eq!(packs.len(), 1);
+        assert_eq!(packs[0].id, "core");
+        assert_eq!(packs[0].version, "1.21.11");
+
+        // Echo the offered packs so the server can omit registry NBT.
+        let mut body = loadstone_protocol::PacketWriter::new();
+        ServerboundKnownPacks { packs }.encode(&mut body);
+        self.send_packet(ServerboundKnownPacks::ID, body.as_slice())
+            .await;
+
+        let info = ClientInformation {
+            locale: "en_us".to_string(),
+            view_distance: 12,
+            chat_flags: 0,
+            chat_colors: true,
+            skin_parts: 0x7f,
+            main_hand: 1,
+            text_filtering: false,
+            server_listing: true,
+            particle_status: 0,
+        };
+        let mut body = loadstone_protocol::PacketWriter::new();
+        info.encode(&mut body);
+        self.send_packet(ClientInformation::ID, body.as_slice())
+            .await;
+
+        let mut registries = Vec::new();
+        loop {
+            let (id, body) = self.recv_timed().await;
+            if id == RegistryData::ID {
+                let packet = RegistryData::decode(&mut PacketReader::new(&body)).unwrap();
+                assert!(
+                    packet.entries.iter().all(|entry| entry.data.is_none()),
+                    "registry NBT must be omitted when core is known"
+                );
+                registries.push((packet.registry_id, packet.entries.len()));
+            } else if id == UpdateTags::ID {
+                let tags = UpdateTags::decode(&mut PacketReader::new(&body)).unwrap();
+                assert!(!tags.registries.is_empty());
+            } else if id == FinishConfiguration::ID {
+                self.send_packet(AcknowledgeFinishConfiguration::ID, &[])
+                    .await;
+                break;
+            } else {
+                panic!("unexpected configuration packet {id:#x}");
+            }
+        }
+        registries
+    }
 }
 
 fn read_varint(bytes: &[u8]) -> (u32, usize) {
@@ -323,6 +398,11 @@ async fn offline_login_reaches_configuration() {
     assert!(success.properties.is_empty());
 
     client.acknowledged().await;
+    let registries = client.complete_configuration().await;
+    assert_eq!(registries.len(), 23);
+    assert!(registries.contains(&("minecraft:dimension_type".to_string(), 4)));
+    assert!(registries.contains(&("minecraft:worldgen/biome".to_string(), 65)));
+
     tokio::time::timeout(Duration::from_secs(5), server)
         .await
         .expect("server did not finish login")
@@ -361,6 +441,9 @@ async fn online_login_negotiates_encryption_and_session() {
     assert_eq!(success.username, "MockPlayer");
 
     client.acknowledged().await;
+    let registries = client.complete_configuration().await;
+    assert_eq!(registries.len(), 23);
+
     tokio::time::timeout(Duration::from_secs(5), server)
         .await
         .expect("server did not finish login")

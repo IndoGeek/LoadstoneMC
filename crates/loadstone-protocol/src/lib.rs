@@ -1,4 +1,5 @@
 mod error;
+mod nbt;
 mod packet;
 mod read;
 mod varint;
@@ -7,6 +8,7 @@ mod write;
 pub mod packets;
 
 pub use error::ProtocolError;
+pub use nbt::Nbt;
 pub use packet::{Packet, PacketId};
 pub use read::PacketReader;
 pub use varint::{read_varint, write_varint, VarInt};

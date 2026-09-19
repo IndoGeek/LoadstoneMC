@@ -2,6 +2,12 @@ use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+use loadstone_protocol::packets::configuration::{
+    AcknowledgeFinishConfiguration, ClientInformation, ClientboundKnownPacks,
+    ConfigurationKeepAlive, ConfigurationKeepAliveResponse, ConfigurationPong, CustomPayload,
+    FeatureFlags, FinishConfiguration, KnownPack, NetworkTag, RegistryData, RegistryEntry,
+    ServerboundKnownPacks, TagRegistry, UpdateTags,
+};
 use loadstone_protocol::packets::handshake::Handshake;
 use loadstone_protocol::packets::login::{
     EncryptionRequest, EncryptionResponse, LoginAcknowledged, LoginDisconnect, LoginStart,
@@ -193,6 +199,10 @@ pub async fn run_connection(stream: TcpStream, config: ConnectionConfig) -> Resu
         1 => status_phase(&mut conn, &config).await?,
         2 => {
             login_phase(conn, &handshake, &config).await?;
+            info!(
+                ?peer,
+                "connection finished: configuration complete, play state not implemented"
+            );
         }
         other => {
             warn!(?peer, state = other, "unknown next state");
@@ -256,7 +266,7 @@ async fn login_phase(
     conn: Connection,
     handshake: &Handshake,
     config: &ConnectionConfig,
-) -> Result<Connection, NetError> {
+) -> Result<(), NetError> {
     let mut conn = conn;
 
     if handshake.protocol_version != PROTOCOL_VERSION {
@@ -271,7 +281,7 @@ async fn login_phase(
             handshake.protocol_version
         );
         send_disconnect(&mut conn, reason).await?;
-        return Ok(conn);
+        return Ok(());
     }
 
     let frame = conn.read_packet().await?;
@@ -288,7 +298,9 @@ async fn login_phase(
 
     if !config.online_mode {
         info!(name = %start.name, mode = "offline", "login complete");
-        return finish_login(conn, start.uuid, start.name).await;
+        let username = start.name.clone();
+        let conn = finish_login(conn, start.uuid, start.name).await?;
+        return configuration_phase(conn, &username).await;
     }
 
     // Online mode: encryption + Mojang session verification.
@@ -352,12 +364,14 @@ async fn login_phase(
             None => {
                 warn!(name = %start.name, "failed to verify username");
                 send_disconnect(&mut conn, "Failed to verify username!".to_string()).await?;
-                return Ok(conn);
+                return Ok(());
             }
         };
     info!(name = %profile.name, uuid = %profile.uuid, mode = "online", "login complete");
 
-    finish_login(conn, profile.uuid, profile.name).await
+    let username = profile.name.clone();
+    let conn = finish_login(conn, profile.uuid, profile.name).await?;
+    configuration_phase(conn, &username).await
 }
 
 async fn finish_login(
@@ -389,8 +403,152 @@ async fn finish_login(
             },
         ));
     }
-    info!(name = %username, "client acknowledged login; entering configuration (not yet implemented)");
+    info!(name = %username, "client acknowledged login; entering configuration");
     Ok(conn)
+}
+
+/// Run the Configuration state through to the Play boundary.
+///
+/// The server negotiates `minecraft:core` with the client and then sends every
+/// synchronized registry with its NBT omitted, so the client resolves entry
+/// data from its own data pack. Network tags are always sent in full.
+async fn configuration_phase(mut conn: Connection, username: &str) -> Result<(), NetError> {
+    let synced = loadstone_registry::synced_registries();
+
+    // Vanilla opens the state with its brand and feature flags.
+    let body = encode_body(&CustomPayload {
+        channel: "minecraft:brand".to_string(),
+        data: encode_brand("LoadstoneMC"),
+    });
+    conn.write_packet(CustomPayload::ID, &body).await?;
+
+    let body = encode_body(&FeatureFlags {
+        features: vec!["minecraft:vanilla".to_string()],
+    });
+    conn.write_packet(FeatureFlags::ID, &body).await?;
+
+    // Offer the data packs we can source entry data from.
+    let body = encode_body(&ClientboundKnownPacks {
+        packs: vec![KnownPack {
+            namespace: synced.known_pack.namespace.clone(),
+            id: synced.known_pack.id.clone(),
+            version: synced.known_pack.version.clone(),
+        }],
+    });
+    conn.write_packet(ClientboundKnownPacks::ID, &body).await?;
+
+    // The client replies with its client information and the packs it knows.
+    let mut have_info = false;
+    let mut client_packs = Vec::new();
+    while !have_info || client_packs.is_empty() {
+        let frame = conn.read_packet().await?;
+        match frame.id {
+            ClientInformation::ID => {
+                let info = ClientInformation::decode(&mut PacketReader::new(&frame.body))?;
+                debug!(
+                    locale = %info.locale,
+                    view_distance = info.view_distance,
+                    "client information"
+                );
+                have_info = true;
+            }
+            ServerboundKnownPacks::ID => {
+                let packs = ServerboundKnownPacks::decode(&mut PacketReader::new(&frame.body))?;
+                client_packs = packs.packs;
+            }
+            ConfigurationKeepAlive::ID => {
+                let alive =
+                    ConfigurationKeepAliveResponse::decode(&mut PacketReader::new(&frame.body))?;
+                let body = encode_body(&ConfigurationKeepAlive { id: alive.id });
+                conn.write_packet(ConfigurationKeepAlive::ID, &body).await?;
+            }
+            ConfigurationPong::ID => {}
+            other => warn!(id = other, "ignoring unexpected configuration packet"),
+        }
+    }
+
+    let knows_core = client_packs.iter().any(|pack| {
+        pack.namespace == synced.known_pack.namespace
+            && pack.id == synced.known_pack.id
+            && pack.version == synced.known_pack.version
+    });
+    if !knows_core {
+        // Without mutual `minecraft:core` the client would have to receive full
+        // registry NBT, which we do not ship. Vanilla clients always know it.
+        warn!(
+            name = %username,
+            "client does not know minecraft:core; registry entry data cannot be resolved"
+        );
+    }
+
+    for registry in &synced.registries {
+        let packet = RegistryData {
+            registry_id: registry.id.clone(),
+            entries: registry
+                .entries
+                .iter()
+                .map(|name| RegistryEntry {
+                    name: name.clone(),
+                    data: None,
+                })
+                .collect(),
+        };
+        let body = encode_body(&packet);
+        conn.write_packet(RegistryData::ID, &body).await?;
+    }
+    debug!(
+        count = synced.registries.len(),
+        "sent synchronized registries"
+    );
+
+    let tags = loadstone_registry::network_tags();
+    let packet = UpdateTags {
+        registries: tags
+            .registries
+            .iter()
+            .map(|registry| TagRegistry {
+                registry: registry.registry.clone(),
+                tags: registry
+                    .tags
+                    .iter()
+                    .map(|tag| NetworkTag {
+                        name: tag.name.clone(),
+                        entries: tag.entries.clone(),
+                    })
+                    .collect(),
+            })
+            .collect(),
+    };
+    let body = encode_body(&packet);
+    conn.write_packet(UpdateTags::ID, &body).await?;
+
+    let body = encode_body(&FinishConfiguration);
+    conn.write_packet(FinishConfiguration::ID, &body).await?;
+
+    loop {
+        let frame = conn.read_packet().await?;
+        match frame.id {
+            AcknowledgeFinishConfiguration::ID => break,
+            ConfigurationKeepAlive::ID => {
+                let alive =
+                    ConfigurationKeepAliveResponse::decode(&mut PacketReader::new(&frame.body))?;
+                let body = encode_body(&ConfigurationKeepAlive { id: alive.id });
+                conn.write_packet(ConfigurationKeepAlive::ID, &body).await?;
+            }
+            ConfigurationPong::ID => {}
+            other => warn!(id = other, "ignoring unexpected configuration packet"),
+        }
+    }
+
+    debug!(name = %username, "configuration complete");
+    Ok(())
+}
+
+/// The `minecraft:brand` payload is a single length-prefixed string.
+fn encode_brand(brand: &str) -> Vec<u8> {
+    let mut writer = PacketWriter::new();
+    writer.write_string(brand);
+    writer.into_vec()
 }
 
 async fn send_disconnect(conn: &mut Connection, message: String) -> Result<(), NetError> {
