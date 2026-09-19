@@ -6,7 +6,8 @@ verified over a real socket instead of in-process: server list ping, login
 (offline and online modes, including the RSA key exchange with AES/CFB8
 streaming and a Mojang-style `hasJoined` lookup against a local mock session
 server), the full Configuration handshake, and the Play state where the client
-spawns onto the flat world and chat is echoed back. Also covers the two
+spawns onto the flat world, chat is echoed back, and block edits (dig/place)
+are acknowledged with block changes. Also covers the two
 online-mode refusals: an unverified account, and a key exchange that does not
 echo the verify token.
 
@@ -71,27 +72,40 @@ PKT_CONFIG_SELECT_PACKS = 0x07
 PKT_CONFIG_ACK = 0x03
 
 # Play state, clientbound.
-PKT_PLAY_LOGIN = 0x2E
-PKT_PLAY_SPAWN_POSITION = 0x5B
-PKT_PLAY_CHUNK_BATCH_START = 0x0B
-PKT_PLAY_MAP_CHUNK = 0x2A
+PKT_PLAY_BUNDLE_DELIMITER = 0x00
+PKT_PLAY_SPAWN_ENTITY = 0x01
+PKT_PLAY_BLOCK_CHANGE = 0x08
 PKT_PLAY_CHUNK_BATCH_FINISHED = 0x0A
-PKT_PLAY_KEEP_ALIVE = 0x29
-PKT_PLAY_POSITION = 0x44
-PKT_PLAY_PLAYER_INFO = 0x42
-PKT_PLAY_ABILITIES = 0x3C
-PKT_PLAY_UPDATE_HEALTH = 0x62
-PKT_PLAY_EXPERIENCE = 0x61
-PKT_PLAY_UPDATE_TIME = 0x6B
-PKT_PLAY_SERVER_DATA = 0x50
-PKT_PLAY_SYSTEM_CHAT = 0x72
-PKT_PLAY_DISCONNECT = 0x1E
+PKT_PLAY_CHUNK_BATCH_START = 0x0B
+PKT_PLAY_DISCONNECT = 0x20
+PKT_PLAY_SYNC_ENTITY_POSITION = 0x23
+PKT_PLAY_KEEP_ALIVE = 0x2B
+PKT_PLAY_MAP_CHUNK = 0x2C
+PKT_PLAY_LOGIN = 0x30
+PKT_PLAY_ABILITIES = 0x3E
+PKT_PLAY_PLAYER_REMOVE = 0x43
+PKT_PLAY_PLAYER_INFO = 0x44
+PKT_PLAY_POSITION = 0x46
+PKT_PLAY_ENTITY_HEAD_ROTATION = 0x51
+PKT_PLAY_SERVER_DATA = 0x54
+PKT_PLAY_SPAWN_POSITION = 0x5F
+PKT_PLAY_ENTITY_METADATA = 0x61
+PKT_PLAY_EXPERIENCE = 0x65
+PKT_PLAY_UPDATE_HEALTH = 0x66
+PKT_PLAY_UPDATE_TIME = 0x6F
+PKT_PLAY_SYSTEM_CHAT = 0x77
+PKT_PLAY_REMOVE_ENTITIES = 0x4B
 
 # Play state, serverbound.
 PKT_PLAY_KEEP_ALIVE_RESPONSE = 0x19
 PKT_PLAY_CHUNK_BATCH_RECEIVED = 0x0A
 PKT_PLAY_TELEPORT_CONFIRM = 0x00
 PKT_PLAY_CHAT_MESSAGE = 0x08
+PKT_PLAY_POSITION_SB = 0x1D
+PKT_PLAY_POSITION_LOOK_SB = 0x1E
+PKT_PLAY_LOOK_SB = 0x1F
+PKT_PLAY_BLOCK_DIG = 0x28
+PKT_PLAY_BLOCK_PLACE = 0x3F
 
 MOCK_PLAYER_ID = "0f9b0e00-0000-4000-8000-000000000000"
 
@@ -140,6 +154,11 @@ def read_varint(data: bytes, start: int = 0) -> tuple[int, int]:
 def write_string(text: str) -> bytes:
     raw = text.encode()
     return write_varint(len(raw)) + raw
+
+
+def pack_position(x: int, y: int, z: int) -> int:
+    """Packed position: x in bits 38..63, z in bits 12..37, y in bits 0..11."""
+    return ((x & 0x3FFFFFF) << 38) | ((z & 0x3FFFFFF) << 12) | (y & 0xFFF)
 
 
 def read_string(data: bytes, start: int = 0) -> tuple[str, int]:
@@ -317,11 +336,11 @@ def complete_configuration(client: Client) -> int:
             raise AssertionError("bad configuration packet")
 
 
-def drive_into_play(client: Client, name: str) -> None:
+def drive_into_play(client: Client, name: str, expected_entity_id: int | None = 0) -> int:
     """Consume the spawn sequence of the Play state: the login packet, the 3x3
     chunk batch, the first teleport and the health/welcome line. Acknowledges
     the chunk batch, confirms the teleport and answers keep-alives like a
-    vanilla client would."""
+    vanilla client would. Returns the entity id from the login packet."""
     chunks = 0
     login = position = health = welcome = None
     acked = False
@@ -355,7 +374,9 @@ def drive_into_play(client: Client, name: str) -> None:
     check(chunks == 9, "the client receives a 3x3 chunk batch", f"{chunks} chunks")
 
     (entity_id,) = struct.unpack(">i", login[:4])
-    check(entity_id == 0, "play login assigns entity id 0", str(entity_id))
+    if expected_entity_id is not None:
+        check(entity_id == expected_entity_id,
+              f"play login assigns entity id {expected_entity_id}", str(entity_id))
 
     # teleport: varint id, then three doubles; little-endian for the f32 health below.
     pos = struct.unpack(">3d", position[1:25])
@@ -368,6 +389,7 @@ def drive_into_play(client: Client, name: str) -> None:
 
     check(name.encode() in welcome and b"Welcome" in welcome,
           "a chat welcome greets the player by name")
+    return entity_id
 
 
 def chat_echo(client: Client, name: str, message: str) -> None:
@@ -395,7 +417,162 @@ def chat_echo(client: Client, name: str, message: str) -> None:
             raise AssertionError("kicked in play")
 
 
+def block_round_trip(client: Client) -> None:
+    """Dig the grass below the spawn and place a cobblestone on its empty spot;
+    the server must answer each with a block_change packet matching the new
+    state. The flat template has grass at y=64 and bedrock at y=-64."""
+    # Break the grass block the spawn stands on (8, 64, 8).
+    client.write_packet(
+        PKT_PLAY_BLOCK_DIG,
+        write_varint(2) + struct.pack(">q", pack_position(8, 64, 8)) + bytes([1]) + write_varint(1),
+    )
+    packet_id, body = client.read_packet()
+    if not check(packet_id == PKT_PLAY_BLOCK_CHANGE, "digging answers with a block change",
+                 f"id {packet_id:#04x}"):
+        raise AssertionError("missing block change after dig")
+
+    (location,) = struct.unpack(">q", body[:8])
+    state, _ = read_varint(body, 8)
+    check(location == pack_position(8, 64, 8), "the broken block is the grass at (8,64,8)",
+          hex(location))
+    check(state == 0, "a dug block becomes air", str(state))
+
+    # Place on the top face of the now-empty spot: the block lands above it.
+    client.write_packet(
+        PKT_PLAY_BLOCK_PLACE,
+        write_varint(0)                                   # hand
+        + struct.pack(">q", pack_position(8, 64, 8))      # clicked location
+        + write_varint(1)                                 # top face
+        + struct.pack(">3f", 0.5, 1.0, 0.5)               # cursor
+        + b"\x00\x00"                                    # inside block, world border
+        + write_varint(2),                               # sequence
+    )
+    packet_id, body = client.read_packet()
+    if not check(packet_id == PKT_PLAY_BLOCK_CHANGE,
+                 "placing answers with a block change", f"id {packet_id:#04x}"):
+        raise AssertionError("missing block change after place")
+
+    (location,) = struct.unpack(">q", body[:8])
+    state, _ = read_varint(body, 8)
+    check(location == pack_position(8, 65, 8), "the placed block lands at (8,65,8)", hex(location))
+    check(state == 14, "a placed block becomes cobblestone", str(state))
+
+
 # ── checks ──────────────────────────────────────────────────────────────────────
+# ── two-player shared-world helpers ─────────────────────────────────────────────
+def next_play_packet(client: Client) -> tuple[int, bytes]:
+    """Reads the next Play packet, answering keep-alives and refusing disconnects."""
+    while True:
+        packet_id, body = client.read_packet()
+        if packet_id == PKT_PLAY_KEEP_ALIVE:
+            client.write_packet(PKT_PLAY_KEEP_ALIVE_RESPONSE, body)
+            continue
+        if packet_id == PKT_PLAY_DISCONNECT:
+            check(False, "server does not disconnect during play", repr(body[:80]))
+            raise AssertionError("kicked in play")
+        return packet_id, body
+
+
+def await_spawn(client: Client, expected_uuid: uuid.UUID) -> int:
+    """Reads until the given player's spawn_entity appears, returning their id."""
+    while True:
+        packet_id, body = next_play_packet(client)
+        if packet_id != PKT_PLAY_SPAWN_ENTITY:
+            continue
+        entity_id, size = read_varint(body)
+        spawn_uuid = uuid.UUID(bytes=body[size:size + 16])
+        entity_type, _ = read_varint(body, size + 16)
+        if spawn_uuid == expected_uuid:
+            check(entity_type == 117, "the other player spawns as entity type 117",
+                  str(entity_type))
+            return entity_id
+
+
+def await_sync(client: Client, entity_id: int) -> tuple[float, float, float]:
+    """Reads until an entity sync for `entity_id`, returning the synced position."""
+    while True:
+        packet_id, body = next_play_packet(client)
+        if packet_id != PKT_PLAY_SYNC_ENTITY_POSITION:
+            continue
+        synced_id, size = read_varint(body)
+        if synced_id != entity_id:
+            continue
+        x, y, z = struct.unpack(">3d", body[size:size + 24])
+        return x, y, z
+
+
+def await_block_change(client: Client) -> int:
+    """Reads until a block_change, returning the packed location."""
+    while True:
+        packet_id, body = next_play_packet(client)
+        if packet_id == PKT_PLAY_BLOCK_CHANGE:
+            (location,) = struct.unpack(">q", body[:8])
+            return location
+
+
+def await_player_remove(client: Client) -> bool:
+    """Reads until a player_remove, returning whether one arrived."""
+    while True:
+        packet_id, _body = next_play_packet(client)
+        if packet_id == PKT_PLAY_PLAYER_REMOVE:
+            return True
+
+
+def check_two_players(host: str, port: int) -> None:
+    """Two clients share one world: each sees the other spawn, move, edit blocks
+    and leave."""
+    alice = Client(host, port)
+    bob = Client(host, port)
+    try:
+        handshake(alice, host, port, 2)
+        login_start(alice, "Alice")
+        read_set_compression(alice)
+        read_login_success(alice)
+        alice.write_packet(PKT_LOGIN_ACKNOWLEDGED)
+        complete_configuration(alice)
+        alice_entity = drive_into_play(alice, "Alice", expected_entity_id=None)
+
+        handshake(bob, host, port, 2)
+        bob_uuid = login_start(bob, "Bob")
+        read_set_compression(bob)
+        read_login_success(bob)
+        bob.write_packet(PKT_LOGIN_ACKNOWLEDGED)
+        complete_configuration(bob)
+        bob_entity_login = drive_into_play(bob, "Bob", expected_entity_id=None)
+
+        check(alice_entity != bob_entity_login,
+              "players receive distinct entity ids", f"{alice_entity} == {bob_entity_login}")
+
+        # Alice is introduced to Bob's entity.
+        bob_entity = await_spawn(alice, bob_uuid)
+        check(bob_entity == bob_entity_login,
+              "the spawned entity matches Bob's login entity id",
+              f"{bob_entity} != {bob_entity_login}")
+
+        # Bob's movement is synced to Alice.
+        bob.write_packet(PKT_PLAY_POSITION_SB, struct.pack(">3d", 9.0, 65.0, 8.5) + b"\x01")
+        synced = await_sync(alice, bob_entity)
+        check(synced == (9.0, 65.0, 8.5), "movement reaches the other player", str(synced))
+
+        # Bob's block edit is shared with Alice. (7,64,8) is untouched grass.
+        bob.write_packet(
+            PKT_PLAY_BLOCK_DIG,
+            write_varint(2) + struct.pack(">q", pack_position(7, 64, 8))
+            + bytes([1]) + write_varint(1),
+        )
+        shared = await_block_change(alice)
+        check(shared == pack_position(7, 64, 8),
+              "a block edit is shared between players", hex(shared))
+
+        # Bob leaves; Alice is told to drop him.
+        bob.close()
+        check(await_player_remove(alice),
+              "a leaving player is removed from the other client")
+    finally:
+        alice.close()
+        bob.close()
+
+
 def check_status(host: str, port: int, motd: str) -> None:
     client = Client(host, port)
     try:
@@ -445,6 +622,7 @@ def check_offline_login(host: str, port: int, name: str) -> None:
               f"{registries} registries")
         drive_into_play(client, name)
         chat_echo(client, name, "hello from live check")
+        block_round_trip(client)
     finally:
         client.close()
 
@@ -499,6 +677,7 @@ def check_online_login(host: str, port: int, name: str, session: "MockSession") 
               f"{registries} registries")
         drive_into_play(client, name)
         chat_echo(client, name, "hello from live check")
+        block_round_trip(client)
     finally:
         client.close()
 
@@ -719,6 +898,7 @@ def main() -> int:
 
         if args.mode == "offline":
             check_offline_login(args.host, args.port, args.name)
+            check_two_players(args.host, args.port)
         elif session is not None:
             check_online_login(args.host, args.port, args.mock_name, session)
             check_online_rejection(args.host, args.port, session)

@@ -13,8 +13,9 @@ small, fast, low-overhead core in the spirit of Pumpkin and Steel.
 | Login, offline mode | works |
 | Login, online mode (RSA key exchange, AES-128/CFB8, Mojang `hasJoined`, compression) | works |
 | Configuration state (known packs, feature flags, registry data, tags, finish) | works |
-| Play state (login, world spawn, 3x3 chunk batch, position, keep-alive, chat echo) | works |
-| Entities, movement, worldgen, persistence | not implemented |
+| Play state (login, world spawn, 3x3 chunk batch, position, keep-alive, chat echo, block dig/place) | works |
+| Multiple players in one shared world (tab list, spawn/despawn, movement sync, shared block edits) | works |
+| Non-player entities, mob AI, worldgen, persistence | not implemented |
 
 A vanilla client can ping the server, complete login, and finish the whole
 Configuration handshake: it negotiates `minecraft:core`, receives every
@@ -24,7 +25,14 @@ world spawn and chunk batch (with heightmaps and full-bright sky light),
 acknowledges the chunk batch, teleports the player to spawn, enters the tab
 list, and runs keep-alive, ping/pong, teleport confirmations and chat echo
 (including the Mojang-signed session key chain on online mode) until the client
-disconnects.
+disconnects. The world is mutable: digging a block or placing another is
+validated against a shared in-memory model of the flat world (bedrock is
+unbreakable, out-of-bounds edits are ignored) and the resulting block change is
+broadcast to every player. All connections share that world and a player
+registry: joining players are shown the players already present (tab-list entry,
+`spawn_entity` and skin-layer metadata, wrapped in a bundle), and movement,
+chat and block edits are pushed to the other players' connections. Leaving
+players are announced with `player_remove` + `remove_entities`.
 
 ## Build and run
 
@@ -87,7 +95,10 @@ client acknowledges, and then spawns a simulated player: it checks the Play logi
 packet's dimension/spawn info, the 3x3 chunk batch (ultra-precise heightmaps,
 non-empty chunk data), the spawn position, the teleport to (8.5, 65.0, 8.5),
 full health/hunger, the tab list entry, and the welcome chat line carrying the
-player's name.
+player's name. A second test runs two clients against one server and checks that
+each sees the other spawn (`spawn_entity`, type 117), that movement arrives as an
+entity sync, that a block edit by one is broadcast to the other, and that a
+disconnect produces `player_remove` + `remove_entities`.
 
 `tools/live_login_check.py` does the same over a socket against a real running
 binary, with a client written independently of the server (Python `cryptography`):
@@ -100,15 +111,22 @@ python3 tools/live_login_check.py --no-spawn --port 25565
 
 It covers the server list ping, an offline login, an online login (key exchange
 → AES/CFB8 → `hasJoined` → compression → Login Success → acknowledgement → the
-full Configuration handshake → the Play state) and both online-mode refusals: an
-unverified account, and a key exchange that does not echo the verify token. Exit
-status is non-zero if anything fails, so it can gate a release.
+full Configuration handshake → the Play state), a two-client shared-world check
+(presence, movement, shared block edit, disconnect) and both online-mode
+refusals: an unverified account, and a key exchange that does not echo the
+verify token. Exit status is non-zero if anything fails, so it can gate a
+release.
 
 ## Protocol notes
 
 - The version constants live in `crates/loadstone-protocol/src/lib.rs`.
 - Packet layouts for 1.21.11 were checked against the PrismarineJS
-  `minecraft-data` protocol dump for that version.
+  `minecraft-data` protocol dump for that version, and the Play-state ids were
+  additionally confirmed by capturing live traffic from a real 1.21.11 vanilla
+  server.
+- Protocol 774 has no dedicated player-spawn packet: other players are
+  `spawn_entity` with entity type 117 (`minecraft:player`), sent inside a bundle
+  delimiter pair together with their tab-list entry and entity metadata.
 - Encryption is RSA-1024 with PKCS#1 v1.5 for the key exchange, then
   AES-128/CFB8 over the whole stream with the shared secret as both key and IV,
   exactly as Java's `AES/CFB8/NoPadding` does.
@@ -134,8 +152,11 @@ status is non-zero if anything fails, so it can gate a release.
 
 ## Roadmap
 
-1. **Game feel** — entities, movement, block placement, custom world generation
-   and persistence. The flat 3x3 demo world gets replaced with real chunks.
+1. **Game feel** — non-player entities, mob AI, custom world generation and
+   persistence. The flat 3x3 demo world gets replaced with real chunks. Block
+   edits, movement and player presence already share one world across every
+   connection; the next step is streaming chunks to players as they move and
+   saving the world to disk.
 2. **Custom registries** — the current data is the vanilla set with NBT omitted;
    serving custom biomes/dimensions means emitting entry NBT as well.
 3. **Player data & chat** — verify the Mojang-signed session key chain for chat

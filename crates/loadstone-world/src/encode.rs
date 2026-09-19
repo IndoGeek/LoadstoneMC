@@ -21,6 +21,7 @@ pub const WORLD_HEIGHT: i32 = 384;
 pub const BLOCK_AIR: u16 = 0;
 pub const BLOCK_GRASS_BLOCK: u16 = 9;
 pub const BLOCK_DIRT: u16 = 10;
+pub const BLOCK_COBBLESTONE: u16 = 14;
 pub const BLOCK_BEDROCK: u16 = 85;
 
 /// The flat spawn platform: bedrock at the bottom, dirt filling the middle,

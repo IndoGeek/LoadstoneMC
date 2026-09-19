@@ -1,6 +1,12 @@
+use std::collections::HashMap;
 use std::io;
 use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
+
+use loadstone_world::World;
+use tokio::sync::mpsc;
+use uuid::Uuid;
 
 use loadstone_protocol::packets::configuration::{
     AcknowledgeFinishConfiguration, ClientInformation, ClientboundKnownPacks,
@@ -29,6 +35,29 @@ use crate::error::NetError;
 
 pub const COMPRESSION_THRESHOLD: i32 = 256;
 
+/// A player currently in the world, as seen by every other connection: their
+/// identity, last known position and the channel that pushes packets to their
+/// own connection.
+#[derive(Debug)]
+pub struct SharedPlayer {
+    pub entity_id: i32,
+    pub name: String,
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+    pub yaw: f32,
+    pub pitch: f32,
+    pub out: mpsc::UnboundedSender<(i32, Vec<u8>)>,
+}
+
+/// The state every connection shares: the editable block world and the set of
+/// players currently in it.
+#[derive(Debug, Default)]
+pub struct ServerState {
+    pub next_entity_id: i32,
+    pub players: HashMap<Uuid, SharedPlayer>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ConnectionConfig {
     pub motd: String,
@@ -39,6 +68,10 @@ pub struct ConnectionConfig {
     pub online_mode: bool,
     /// Base URL for Mojang session verification (used in online mode).
     pub sessionserver_url: String,
+    /// The shared block world, edited live by every player.
+    pub world: Arc<Mutex<World>>,
+    /// The shared player registry (entity ids, positions, outbound channels).
+    pub state: Arc<Mutex<ServerState>>,
 }
 
 impl Default for ConnectionConfig {
@@ -50,6 +83,8 @@ impl Default for ConnectionConfig {
             online_mode: false,
             sessionserver_url: "https://sessionserver.mojang.com/session/minecraft/hasJoined"
                 .to_string(),
+            world: Arc::new(Mutex::new(World::new())),
+            state: Arc::new(Mutex::new(ServerState::default())),
         }
     }
 }
@@ -229,7 +264,7 @@ async fn status_phase(conn: &mut Connection, config: &ConnectionConfig) -> Resul
         },
         players: StatusPlayers {
             max: config.max_players,
-            online: config.online_players,
+            online: config.state.lock().unwrap().players.len() as i32,
             sample: Vec::new(),
         },
         description: StatusDescription {
@@ -297,7 +332,7 @@ async fn login_phase(
         info!(name = %start.name, mode = "offline", "login complete");
         let username = start.name.clone();
         let conn = finish_login(conn, start.uuid, start.name).await?;
-        return configuration_phase(conn, start.uuid, &username).await;
+        return configuration_phase(conn, start.uuid, &username, config).await;
     }
 
     // Online mode: encryption + Mojang session verification.
@@ -368,7 +403,7 @@ async fn login_phase(
 
     let username = profile.name.clone();
     let conn = finish_login(conn, profile.uuid, profile.name).await?;
-    configuration_phase(conn, profile.uuid, &username).await
+    configuration_phase(conn, profile.uuid, &username, config).await
 }
 
 async fn finish_login(
@@ -413,6 +448,7 @@ async fn configuration_phase(
     mut conn: Connection,
     uuid: uuid::Uuid,
     username: &str,
+    config: &ConnectionConfig,
 ) -> Result<(), NetError> {
     let synced = loadstone_registry::synced_registries();
 
@@ -544,7 +580,7 @@ async fn configuration_phase(
     debug!(name = %username, "configuration complete");
 
     debug!(name = %username, "entering play state");
-    crate::play::play_phase(conn, uuid, username).await
+    crate::play::play_phase(conn, uuid, username, config).await
 }
 
 /// The `minecraft:brand` payload is a single length-prefixed string.

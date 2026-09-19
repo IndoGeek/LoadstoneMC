@@ -17,6 +17,16 @@ pub fn pack_position(x: i32, y: i32, z: i32) -> i64 {
     (i64::from(x) & 0x3FFFFFF) << 38 | (i64::from(z) & 0x3FFFFFF) << 12 | (i64::from(y) & 0xFFF)
 }
 
+/// Splits a packed position back into `(x, y, z)`. The wire layout is x in bits
+/// 38..63, z in bits 12..37 and y in bits 0..11, all stored as fixed-width
+/// two's-complement fields.
+pub fn unpack_position(position: i64) -> (i32, i32, i32) {
+    let x = (position >> 38) as i32;
+    let z = ((position >> 12) as i32) << 6 >> 6;
+    let y = (((position & 0xFFF) as u16) << 4) as i16 >> 4;
+    (x, i32::from(y), z)
+}
+
 fn write_byte_array(out: &mut PacketWriter, data: &[u8]) {
     out.write_varint(data.len() as i32).write_bytes(data);
 }
@@ -31,7 +41,7 @@ fn read_byte_array(reader: &mut PacketReader<'_>) -> Result<Vec<u8>, ProtocolErr
 
 // ── Clientbound ────────────────────────────────────────────────────────────
 
-/// S->C Login (id 0x2E).
+/// S->C Login (id 0x30).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlayLogin {
     pub entity_id: i32,
@@ -68,7 +78,7 @@ pub struct SpawnInfo {
 }
 
 impl Packet for PlayLogin {
-    const ID: i32 = 0x2E;
+    const ID: i32 = 0x30;
 
     fn encode(&self, out: &mut PacketWriter) {
         out.write_i32(self.entity_id).write_bool(self.is_hardcore);
@@ -162,14 +172,14 @@ fn decode_spawn_info(reader: &mut PacketReader<'_>) -> Result<SpawnInfo, Protoco
     })
 }
 
-/// S->C Keep Alive (id 0x29).
+/// S->C Keep Alive (id 0x2B).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlayKeepAlive {
     pub keep_alive_id: i64,
 }
 
 impl Packet for PlayKeepAlive {
-    const ID: i32 = 0x29;
+    const ID: i32 = 0x2B;
 
     fn encode(&self, out: &mut PacketWriter) {
         out.write_i64(self.keep_alive_id);
@@ -238,7 +248,7 @@ impl ChunkBlockEntity {
     }
 }
 
-/// S->C Level Chunk With Light (id 0x2A), the chunk data + light payload.
+/// S->C Level Chunk With Light (id 0x2C), the chunk data + light payload.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MapChunk {
     pub x: i32,
@@ -257,7 +267,7 @@ pub struct MapChunk {
 }
 
 impl Packet for MapChunk {
-    const ID: i32 = 0x2A;
+    const ID: i32 = 0x2C;
 
     fn encode(&self, out: &mut PacketWriter) {
         out.write_i32(self.x).write_i32(self.z);
@@ -380,8 +390,28 @@ impl Packet for MapChunk {
     }
 }
 
-/// S->C Spawn Position (id 0x5B); also the respawn data type.
-#[derive(Debug, Clone)]
+/// S->C Block Change (id 0x08): a single block's state was updated in place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockChange {
+    pub location: i64,
+    pub block_state: i32,
+}
+
+impl Packet for BlockChange {
+    const ID: i32 = 0x08;
+
+    fn encode(&self, out: &mut PacketWriter) {
+        out.write_i64(self.location).write_varint(self.block_state);
+    }
+
+    fn decode(reader: &mut PacketReader<'_>) -> Result<Self, ProtocolError> {
+        Ok(Self {
+            location: reader.read_i64()?,
+            block_state: reader.read_varint()?,
+        })
+    }
+}
+
 pub struct SpawnPosition {
     pub dimension_name: String,
     /// Packed block position of the world spawn.
@@ -391,7 +421,7 @@ pub struct SpawnPosition {
 }
 
 impl Packet for SpawnPosition {
-    const ID: i32 = 0x5B;
+    const ID: i32 = 0x5F;
 
     fn encode(&self, out: &mut PacketWriter) {
         out.write_string(&self.dimension_name)
@@ -410,7 +440,7 @@ impl Packet for SpawnPosition {
     }
 }
 
-/// S->C Position (id 0x44), a teleport the client confirms by id.
+/// S->C Position (id 0x46), a teleport the client confirms by id.
 #[derive(Debug, Clone, Copy)]
 pub struct ClientPosition {
     pub teleport_id: i32,
@@ -444,7 +474,7 @@ impl ClientPosition {
 }
 
 impl Packet for ClientPosition {
-    const ID: i32 = 0x44;
+    const ID: i32 = 0x46;
 
     fn encode(&self, out: &mut PacketWriter) {
         out.write_varint(self.teleport_id)
@@ -482,8 +512,8 @@ pub const PLAYER_INFO_UPDATE_GAME_MODE: u8 = 0x04;
 pub const PLAYER_INFO_UPDATE_LISTED: u8 = 0x08;
 pub const PLAYER_INFO_UPDATE_LATENCY: u8 = 0x10;
 pub const PLAYER_INFO_UPDATE_DISPLAY_NAME: u8 = 0x20;
-pub const PLAYER_INFO_UPDATE_LIST_ORDER: u8 = 0x40;
-pub const PLAYER_INFO_UPDATE_HAT: u8 = 0x80;
+pub const PLAYER_INFO_UPDATE_HAT: u8 = 0x40;
+pub const PLAYER_INFO_UPDATE_LIST_ORDER: u8 = 0x80;
 
 /// One tab list entry. `None` fields contribute no bytes on the wire unless the
 /// corresponding action bit is derived as set.
@@ -525,14 +555,14 @@ impl PlayerInfoEntry {
     }
 }
 
-/// S->C Player Info (id 0x42).
+/// S->C Player Info (id 0x44).
 #[derive(Debug, Clone)]
 pub struct PlayerInfoUpdate {
     pub entries: Vec<PlayerInfoEntry>,
 }
 
 impl Packet for PlayerInfoUpdate {
-    const ID: i32 = 0x42;
+    const ID: i32 = 0x44;
 
     fn encode(&self, out: &mut PacketWriter) {
         let of = |entry: &PlayerInfoEntry| entry.actions();
@@ -661,7 +691,7 @@ impl Packet for PlayerInfoUpdate {
     }
 }
 
-/// S->C Abilities (id 0x3C). Bit 0 = invulnerable, bit 1 = flying,
+/// S->C Abilities (id 0x3E). Bit 0 = invulnerable, bit 1 = flying,
 /// bit 2 = allow flying, bit 3 = creative mode.
 #[derive(Debug, Clone, Copy)]
 pub struct Abilities {
@@ -671,7 +701,7 @@ pub struct Abilities {
 }
 
 impl Packet for Abilities {
-    const ID: i32 = 0x3C;
+    const ID: i32 = 0x3E;
 
     fn encode(&self, out: &mut PacketWriter) {
         out.write_i8(self.flags)
@@ -688,7 +718,7 @@ impl Packet for Abilities {
     }
 }
 
-/// S->C Update Health (id 0x62).
+/// S->C Update Health (id 0x66).
 #[derive(Debug, Clone, Copy)]
 pub struct UpdateHealth {
     pub health: f32,
@@ -697,7 +727,7 @@ pub struct UpdateHealth {
 }
 
 impl Packet for UpdateHealth {
-    const ID: i32 = 0x62;
+    const ID: i32 = 0x66;
 
     fn encode(&self, out: &mut PacketWriter) {
         out.write_f32(self.health)
@@ -714,7 +744,7 @@ impl Packet for UpdateHealth {
     }
 }
 
-/// S->C Experience (id 0x61).
+/// S->C Experience (id 0x65).
 #[derive(Debug, Clone, Copy)]
 pub struct Experience {
     pub experience_bar: f32,
@@ -723,7 +753,7 @@ pub struct Experience {
 }
 
 impl Packet for Experience {
-    const ID: i32 = 0x61;
+    const ID: i32 = 0x65;
 
     fn encode(&self, out: &mut PacketWriter) {
         out.write_f32(self.experience_bar)
@@ -740,7 +770,7 @@ impl Packet for Experience {
     }
 }
 
-/// S->C Update Time (id 0x6B).
+/// S->C Update Time (id 0x6F).
 #[derive(Debug, Clone, Copy)]
 pub struct UpdateTime {
     pub age: i64,
@@ -749,7 +779,7 @@ pub struct UpdateTime {
 }
 
 impl Packet for UpdateTime {
-    const ID: i32 = 0x6B;
+    const ID: i32 = 0x6F;
 
     fn encode(&self, out: &mut PacketWriter) {
         out.write_i64(self.age)
@@ -766,7 +796,7 @@ impl Packet for UpdateTime {
     }
 }
 
-/// S->C Server Data (id 0x50).
+/// S->C Server Data (id 0x54).
 #[derive(Debug, Clone)]
 pub struct ServerData {
     /// Anonymous NBT text component.
@@ -775,7 +805,7 @@ pub struct ServerData {
 }
 
 impl Packet for ServerData {
-    const ID: i32 = 0x50;
+    const ID: i32 = 0x54;
 
     fn encode(&self, out: &mut PacketWriter) {
         out.write_bytes(&self.motd);
@@ -800,7 +830,7 @@ impl Packet for ServerData {
     }
 }
 
-/// S->C System Chat (id 0x72).
+/// S->C System Chat (id 0x77).
 #[derive(Debug, Clone)]
 pub struct SystemChat {
     /// Anonymous NBT text component.
@@ -809,7 +839,7 @@ pub struct SystemChat {
 }
 
 impl Packet for SystemChat {
-    const ID: i32 = 0x72;
+    const ID: i32 = 0x77;
 
     fn encode(&self, out: &mut PacketWriter) {
         out.write_bytes(&self.content)
@@ -830,14 +860,14 @@ impl Packet for SystemChat {
     }
 }
 
-/// S->C Ping (id 0x39). The client answers with the serverbound pong.
+/// S->C Ping (id 0x3B). The client answers with the serverbound pong.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlayPing {
     pub id: i32,
 }
 
 impl Packet for PlayPing {
-    const ID: i32 = 0x39;
+    const ID: i32 = 0x3B;
 
     fn encode(&self, out: &mut PacketWriter) {
         out.write_i32(self.id);
@@ -850,14 +880,14 @@ impl Packet for PlayPing {
     }
 }
 
-/// S->C Ping Response (id 0x3A), in reply to a serverbound ping request.
+/// S->C Ping Response (id 0x3C), in reply to a serverbound ping request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlayPong {
     pub id: i64,
 }
 
 impl Packet for PlayPong {
-    const ID: i32 = 0x3A;
+    const ID: i32 = 0x3C;
 
     fn encode(&self, out: &mut PacketWriter) {
         out.write_i64(self.id);
@@ -870,14 +900,14 @@ impl Packet for PlayPong {
     }
 }
 
-/// S->C Disconnect (id 0x1E). The reason is anonymous NBT.
+/// S->C Disconnect (id 0x20). The reason is anonymous NBT.
 #[derive(Debug, Clone)]
 pub struct PlayDisconnect {
     pub reason: Vec<u8>,
 }
 
 impl Packet for PlayDisconnect {
-    const ID: i32 = 0x1E;
+    const ID: i32 = 0x20;
 
     fn encode(&self, out: &mut PacketWriter) {
         out.write_bytes(&self.reason);
@@ -887,6 +917,311 @@ impl Packet for PlayDisconnect {
         Ok(Self {
             reason: reader.read_rest().to_vec(),
         })
+    }
+}
+
+// ── Entity packets ──────────────────────────────────────────────────────────
+
+/// Entity type id of `minecraft:player`, as ordered in the 1.21.11 entity
+/// registry the client is fed at login.
+pub const ENTITY_TYPE_PLAYER: i32 = 117;
+
+/// S->C Spawn Entity (id 0x01): a player (or any entity) appears in the world.
+/// In protocol 774 there is no dedicated player spawn packet; other players are
+/// spawned like any entity with `ENTITY_TYPE_PLAYER`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SpawnEntity {
+    pub entity_id: i32,
+    pub uuid: Uuid,
+    pub entity_type: i32,
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+    pub vx: i16,
+    pub vy: i16,
+    pub vz: i16,
+    pub pitch: i8,
+    pub yaw: i8,
+    pub head_yaw: i8,
+    pub data: i32,
+}
+
+impl SpawnEntity {
+    /// Spawn a player at `(x, y, z)` with yaw/pitch in degrees.
+    pub fn player(
+        entity_id: i32,
+        uuid: Uuid,
+        x: f64,
+        y: f64,
+        z: f64,
+        yaw: f32,
+        pitch: f32,
+    ) -> Self {
+        Self {
+            entity_id,
+            uuid,
+            entity_type: ENTITY_TYPE_PLAYER,
+            x,
+            y,
+            z,
+            vx: 0,
+            vy: 0,
+            vz: 0,
+            pitch: degree_to_angle(pitch),
+            yaw: degree_to_angle(yaw),
+            head_yaw: degree_to_angle(yaw),
+            data: 0,
+        }
+    }
+}
+
+impl Packet for SpawnEntity {
+    const ID: i32 = 0x01;
+
+    fn encode(&self, out: &mut PacketWriter) {
+        out.write_varint(self.entity_id)
+            .write_uuid(self.uuid)
+            .write_varint(self.entity_type)
+            .write_f64(self.x)
+            .write_f64(self.y)
+            .write_f64(self.z)
+            .write_i16(self.vx)
+            .write_i16(self.vy)
+            .write_i16(self.vz)
+            .write_i8(self.pitch)
+            .write_i8(self.yaw)
+            .write_i8(self.head_yaw)
+            .write_varint(self.data);
+    }
+
+    fn decode(reader: &mut PacketReader<'_>) -> Result<Self, ProtocolError> {
+        Ok(Self {
+            entity_id: reader.read_varint()?,
+            uuid: reader.read_uuid()?,
+            entity_type: reader.read_varint()?,
+            x: reader.read_f64()?,
+            y: reader.read_f64()?,
+            z: reader.read_f64()?,
+            vx: reader.read_i16()?,
+            vy: reader.read_i16()?,
+            vz: reader.read_i16()?,
+            pitch: reader.read_i8()?,
+            yaw: reader.read_i8()?,
+            head_yaw: reader.read_i8()?,
+            data: reader.read_varint()?,
+        })
+    }
+}
+
+/// Convert a yaw/pitch in degrees to the protocol's turn (byte) unit.
+pub fn degree_to_angle(degrees: f32) -> i8 {
+    ((degrees / 360.0) * 256.0).round() as i32 as i8
+}
+
+/// S->C Remove Entities (id 0x4B): a list of entity ids vanishes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RemoveEntities {
+    pub entity_ids: Vec<i32>,
+}
+
+impl Packet for RemoveEntities {
+    const ID: i32 = 0x4B;
+
+    fn encode(&self, out: &mut PacketWriter) {
+        out.write_varint(self.entity_ids.len() as i32);
+        for id in &self.entity_ids {
+            out.write_varint(*id);
+        }
+    }
+
+    fn decode(reader: &mut PacketReader<'_>) -> Result<Self, ProtocolError> {
+        let count = reader.read_varint()?;
+        if count < 0 {
+            return Err(ProtocolError::InvalidStringLength(count));
+        }
+        let mut entity_ids = Vec::with_capacity(count as usize);
+        for _ in 0..count {
+            entity_ids.push(reader.read_varint()?);
+        }
+        Ok(Self { entity_ids })
+    }
+}
+
+/// S->C Player Remove (id 0x43): remove players from the tab list.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlayerRemove {
+    pub players: Vec<Uuid>,
+}
+
+impl Packet for PlayerRemove {
+    const ID: i32 = 0x43;
+
+    fn encode(&self, out: &mut PacketWriter) {
+        out.write_varint(self.players.len() as i32);
+        for uuid in &self.players {
+            out.write_uuid(*uuid);
+        }
+    }
+
+    fn decode(reader: &mut PacketReader<'_>) -> Result<Self, ProtocolError> {
+        let count = reader.read_varint()?;
+        if count < 0 {
+            return Err(ProtocolError::InvalidStringLength(count));
+        }
+        let mut players = Vec::with_capacity(count as usize);
+        for _ in 0..count {
+            players.push(reader.read_uuid()?);
+        }
+        Ok(Self { players })
+    }
+}
+
+/// S->C Sync Entity Position (id 0x23): absolute position + velocity sync for
+/// an entity, broadcast to every other player when one moves.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SyncEntityPosition {
+    pub entity_id: i32,
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+    pub vx: f64,
+    pub vy: f64,
+    pub vz: f64,
+    pub yaw: f32,
+    pub pitch: f32,
+    pub on_ground: bool,
+}
+
+impl Packet for SyncEntityPosition {
+    const ID: i32 = 0x23;
+
+    fn encode(&self, out: &mut PacketWriter) {
+        out.write_varint(self.entity_id)
+            .write_f64(self.x)
+            .write_f64(self.y)
+            .write_f64(self.z)
+            .write_f64(self.vx)
+            .write_f64(self.vy)
+            .write_f64(self.vz)
+            .write_f32(self.yaw)
+            .write_f32(self.pitch)
+            .write_bool(self.on_ground);
+    }
+
+    fn decode(reader: &mut PacketReader<'_>) -> Result<Self, ProtocolError> {
+        Ok(Self {
+            entity_id: reader.read_varint()?,
+            x: reader.read_f64()?,
+            y: reader.read_f64()?,
+            z: reader.read_f64()?,
+            vx: reader.read_f64()?,
+            vy: reader.read_f64()?,
+            vz: reader.read_f64()?,
+            yaw: reader.read_f32()?,
+            pitch: reader.read_f32()?,
+            on_ground: reader.read_bool()?,
+        })
+    }
+}
+
+/// S->C Entity Head Rotation (id 0x51): a player rotated its head.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EntityHeadRotation {
+    pub entity_id: i32,
+    pub head_yaw: i8,
+}
+
+impl Packet for EntityHeadRotation {
+    const ID: i32 = 0x51;
+
+    fn encode(&self, out: &mut PacketWriter) {
+        out.write_varint(self.entity_id).write_i8(self.head_yaw);
+    }
+
+    fn decode(reader: &mut PacketReader<'_>) -> Result<Self, ProtocolError> {
+        Ok(Self {
+            entity_id: reader.read_varint()?,
+            head_yaw: reader.read_i8()?,
+        })
+    }
+}
+
+/// S->C Entity Look (id 0x36): an entity rotated its body without moving.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EntityLook {
+    pub entity_id: i32,
+    pub yaw: i8,
+    pub pitch: i8,
+    pub on_ground: bool,
+}
+
+impl EntityLook {
+    /// Build a look packet from yaw/pitch in degrees.
+    pub fn from_degrees(entity_id: i32, yaw: f32, pitch: f32, on_ground: bool) -> Self {
+        Self {
+            entity_id,
+            yaw: degree_to_angle(yaw),
+            pitch: degree_to_angle(pitch),
+            on_ground,
+        }
+    }
+}
+
+impl Packet for EntityLook {
+    const ID: i32 = 0x36;
+
+    fn encode(&self, out: &mut PacketWriter) {
+        out.write_varint(self.entity_id)
+            .write_i8(self.yaw)
+            .write_i8(self.pitch)
+            .write_bool(self.on_ground);
+    }
+
+    fn decode(reader: &mut PacketReader<'_>) -> Result<Self, ProtocolError> {
+        Ok(Self {
+            entity_id: reader.read_varint()?,
+            yaw: reader.read_i8()?,
+            pitch: reader.read_i8()?,
+            on_ground: reader.read_bool()?,
+        })
+    }
+}
+
+/// S->C Set Entity Metadata (id 0x61). A raw metadata blob with the `0xFF`
+/// terminator; used to send the skin-layers flag so other players' skins render.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EntityMetadata {
+    pub entity_id: i32,
+    pub blob: Vec<u8>,
+}
+
+impl Packet for EntityMetadata {
+    const ID: i32 = 0x61;
+
+    fn encode(&self, out: &mut PacketWriter) {
+        out.write_varint(self.entity_id).write_bytes(&self.blob);
+    }
+
+    fn decode(reader: &mut PacketReader<'_>) -> Result<Self, ProtocolError> {
+        Ok(Self {
+            entity_id: reader.read_varint()?,
+            blob: reader.read_rest().to_vec(),
+        })
+    }
+}
+
+/// S->C Bundle Delimiter (id 0x00): an empty packet that brackets a batch of
+/// packets the client must apply together.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BundleDelimiter;
+
+impl Packet for BundleDelimiter {
+    const ID: i32 = 0x00;
+
+    fn encode(&self, _out: &mut PacketWriter) {}
+
+    fn decode(_reader: &mut PacketReader<'_>) -> Result<Self, ProtocolError> {
+        Ok(Self)
     }
 }
 
@@ -1074,12 +1409,12 @@ impl Packet for ChatSessionUpdate {
     }
 }
 
-/// C->S Player Loaded (id 0x29): the client cleared its loading screen.
+/// C->S Player Loaded (id 0x2B): the client cleared its loading screen.
 #[derive(Debug, Clone, Copy)]
 pub struct PlayerLoaded;
 
 impl Packet for PlayerLoaded {
-    const ID: i32 = 0x29;
+    const ID: i32 = 0x2B;
 
     fn encode(&self, _out: &mut PacketWriter) {}
 
@@ -1138,7 +1473,7 @@ impl MovementFlags {
     pub const HORIZONTAL_COLLISION: u8 = 0x02;
 }
 
-/// C->S Position (id 0x1B).
+/// C->S Position (id 0x1D).
 #[derive(Debug, Clone, Copy)]
 pub struct PlayerPosition {
     pub x: f64,
@@ -1148,7 +1483,7 @@ pub struct PlayerPosition {
 }
 
 impl Packet for PlayerPosition {
-    const ID: i32 = 0x1B;
+    const ID: i32 = 0x1D;
 
     fn encode(&self, out: &mut PacketWriter) {
         out.write_f64(self.x)
@@ -1167,7 +1502,7 @@ impl Packet for PlayerPosition {
     }
 }
 
-/// C->S Position and Look (id 0x1C).
+/// C->S Position and Look (id 0x1E).
 #[derive(Debug, Clone, Copy)]
 pub struct PlayerPositionLook {
     pub x: f64,
@@ -1179,7 +1514,7 @@ pub struct PlayerPositionLook {
 }
 
 impl Packet for PlayerPositionLook {
-    const ID: i32 = 0x1C;
+    const ID: i32 = 0x1E;
 
     fn encode(&self, out: &mut PacketWriter) {
         out.write_f64(self.x)
@@ -1202,7 +1537,7 @@ impl Packet for PlayerPositionLook {
     }
 }
 
-/// C->S Look (id 0x1D).
+/// C->S Look (id 0x1F).
 #[derive(Debug, Clone, Copy)]
 pub struct PlayerLook {
     pub yaw: f32,
@@ -1211,7 +1546,7 @@ pub struct PlayerLook {
 }
 
 impl Packet for PlayerLook {
-    const ID: i32 = 0x1D;
+    const ID: i32 = 0x1F;
 
     fn encode(&self, out: &mut PacketWriter) {
         out.write_f32(self.yaw)
@@ -1228,14 +1563,14 @@ impl Packet for PlayerLook {
     }
 }
 
-/// C->S Flying (id 0x1E).
+/// C->S Flying (id 0x20).
 #[derive(Debug, Clone, Copy)]
 pub struct PlayerFlying {
     pub flags: u8,
 }
 
 impl Packet for PlayerFlying {
-    const ID: i32 = 0x1E;
+    const ID: i32 = 0x20;
 
     fn encode(&self, out: &mut PacketWriter) {
         out.write_u8(self.flags);
@@ -1248,14 +1583,14 @@ impl Packet for PlayerFlying {
     }
 }
 
-/// C->S Ping Request (id 0x23). The server answers with `PlayPong`.
+/// C->S Ping Request (id 0x25). The server answers with `PlayPong`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PingRequest {
     pub id: i64,
 }
 
 impl Packet for PingRequest {
-    const ID: i32 = 0x23;
+    const ID: i32 = 0x25;
 
     fn encode(&self, out: &mut PacketWriter) {
         out.write_i64(self.id);
@@ -1268,14 +1603,14 @@ impl Packet for PingRequest {
     }
 }
 
-/// C->S Pong (id 0x2A), in reply to a serverbound `PlayPing`.
+/// C->S Pong (id 0x2C), in reply to a serverbound `PlayPing`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlayPongResponse {
     pub id: i32,
 }
 
 impl Packet for PlayPongResponse {
-    const ID: i32 = 0x2A;
+    const ID: i32 = 0x2C;
 
     fn encode(&self, out: &mut PacketWriter) {
         out.write_i32(self.id);
@@ -1328,13 +1663,13 @@ impl Packet for ClientCommand {
     }
 }
 
-/// C->S Configuration Acknowledged (id 0x0E), sent late in Play when the
+/// C->S Configuration Acknowledged (id 0x0F), sent late in Play when the
 /// client returns from a world-bound configuration transition.
 #[derive(Debug, Clone, Copy)]
 pub struct PlayConfigurationAcknowledged;
 
 impl Packet for PlayConfigurationAcknowledged {
-    const ID: i32 = 0x0E;
+    const ID: i32 = 0x0F;
 
     fn encode(&self, _out: &mut PacketWriter) {}
 
@@ -1343,7 +1678,7 @@ impl Packet for PlayConfigurationAcknowledged {
     }
 }
 
-/// C->S Custom Payload (id 0x13), to the end of the packet.
+/// C->S Custom Payload (id 0x15), to the end of the packet.
 #[derive(Debug, Clone)]
 pub struct ClientCustomPayload {
     pub channel: String,
@@ -1351,7 +1686,7 @@ pub struct ClientCustomPayload {
 }
 
 impl Packet for ClientCustomPayload {
-    const ID: i32 = 0x13;
+    const ID: i32 = 0x15;
 
     fn encode(&self, out: &mut PacketWriter) {
         out.write_string(&self.channel).write_bytes(&self.data);
@@ -1379,14 +1714,14 @@ impl Packet for TickEnd {
     }
 }
 
-/// C->S Arm Animation (id 0x3A).
+/// C->S Arm Animation (id 0x3C).
 #[derive(Debug, Clone, Copy)]
 pub struct ArmAnimation {
     pub hand: i32,
 }
 
 impl Packet for ArmAnimation {
-    const ID: i32 = 0x3A;
+    const ID: i32 = 0x3C;
 
     fn encode(&self, out: &mut PacketWriter) {
         out.write_varint(self.hand);
@@ -1399,14 +1734,14 @@ impl Packet for ArmAnimation {
     }
 }
 
-/// C->S Abilities (id 0x25).
+/// C->S Abilities (id 0x27).
 #[derive(Debug, Clone, Copy)]
 pub struct PlayerAbilities {
     pub flags: i8,
 }
 
 impl Packet for PlayerAbilities {
-    const ID: i32 = 0x25;
+    const ID: i32 = 0x27;
 
     fn encode(&self, out: &mut PacketWriter) {
         out.write_i8(self.flags);
@@ -1419,7 +1754,7 @@ impl Packet for PlayerAbilities {
     }
 }
 
-/// C->S Block Dig (id 0x26).
+/// C->S Block Dig (id 0x28).
 #[derive(Debug, Clone, Copy)]
 pub struct BlockDig {
     pub status: i32,
@@ -1430,7 +1765,7 @@ pub struct BlockDig {
 }
 
 impl Packet for BlockDig {
-    const ID: i32 = 0x26;
+    const ID: i32 = 0x28;
 
     fn encode(&self, out: &mut PacketWriter) {
         out.write_varint(self.status)
@@ -1449,7 +1784,7 @@ impl Packet for BlockDig {
     }
 }
 
-/// C->S Entity Action (id 0x27).
+/// C->S Entity Action (id 0x29).
 #[derive(Debug, Clone, Copy)]
 pub struct EntityAction {
     pub entity_id: i32,
@@ -1458,7 +1793,7 @@ pub struct EntityAction {
 }
 
 impl Packet for EntityAction {
-    const ID: i32 = 0x27;
+    const ID: i32 = 0x29;
 
     fn encode(&self, out: &mut PacketWriter) {
         out.write_varint(self.entity_id)
@@ -1475,7 +1810,7 @@ impl Packet for EntityAction {
     }
 }
 
-/// C->S Block Place (id 0x3D).
+/// C->S Block Place (id 0x3F).
 #[derive(Debug, Clone, Copy)]
 pub struct BlockPlace {
     pub hand: i32,
@@ -1491,7 +1826,7 @@ pub struct BlockPlace {
 }
 
 impl Packet for BlockPlace {
-    const ID: i32 = 0x3D;
+    const ID: i32 = 0x3F;
 
     fn encode(&self, out: &mut PacketWriter) {
         out.write_varint(self.hand)
@@ -1520,7 +1855,7 @@ impl Packet for BlockPlace {
     }
 }
 
-/// C->S Use Item (id 0x3E).
+/// C->S Use Item (id 0x40).
 #[derive(Debug, Clone, Copy)]
 pub struct UseItem {
     pub hand: i32,
@@ -1530,7 +1865,7 @@ pub struct UseItem {
 }
 
 impl Packet for UseItem {
-    const ID: i32 = 0x3E;
+    const ID: i32 = 0x40;
 
     fn encode(&self, out: &mut PacketWriter) {
         out.write_varint(self.hand)
@@ -1549,14 +1884,14 @@ impl Packet for UseItem {
     }
 }
 
-/// C->S Held Item Slot (id 0x32).
+/// C->S Held Item Slot (id 0x34).
 #[derive(Debug, Clone, Copy)]
 pub struct HeldItemSlot {
     pub slot_id: i16,
 }
 
 impl Packet for HeldItemSlot {
-    const ID: i32 = 0x32;
+    const ID: i32 = 0x34;
 
     fn encode(&self, out: &mut PacketWriter) {
         out.write_i16(self.slot_id);
@@ -1627,6 +1962,14 @@ mod tests {
     }
 
     #[test]
+    fn block_change_roundtrip() {
+        roundtrip(BlockChange {
+            location: pack_position(-3, 64, 12),
+            block_state: 14,
+        });
+    }
+
+    #[test]
     fn position_packing_matches_vanilla_layout() {
         // y in the low 12 bits, z mid 26, x high 26.
         assert_eq!(pack_position(1, 64, 2) & 0xFFF, 64);
@@ -1634,5 +1977,72 @@ mod tests {
         assert_eq!((pack_position(1, 64, 2) >> 12) & 0x3FFFFFF, 2);
         assert_eq!(pack_position(-1, -64, -1), pack_position(-1, -64, -1));
         assert_ne!(pack_position(0, 0, 0), pack_position(1, 0, 0));
+
+        for (x, y, z) in [
+            (0, 0, 0),
+            (8, 65, 8),
+            (-1, -64, -1),
+            (1_000_000, -64, 1_000_000),
+        ] {
+            assert_eq!(unpack_position(pack_position(x, y, z)), (x, y, z));
+        }
+    }
+
+    #[test]
+    fn entity_packets_roundtrip() {
+        let uuid = Uuid::from_u128(0xdeadbeef);
+        roundtrip(SpawnEntity::player(3, uuid, 8.5, 65.0, 8.5, 90.0, 0.0));
+        roundtrip(SpawnEntity {
+            entity_id: 7,
+            uuid,
+            entity_type: ENTITY_TYPE_PLAYER,
+            x: 1.0,
+            y: 2.0,
+            z: 3.0,
+            vx: 1,
+            vy: -2,
+            vz: 3,
+            pitch: 4,
+            yaw: 5,
+            head_yaw: 6,
+            data: 0,
+        });
+        roundtrip(RemoveEntities {
+            entity_ids: vec![3, 9, 127],
+        });
+        roundtrip(PlayerRemove {
+            players: vec![uuid, Uuid::new_v4()],
+        });
+        roundtrip(SyncEntityPosition {
+            entity_id: 3,
+            x: 10.0,
+            y: 64.5,
+            z: -3.0,
+            vx: 0.0,
+            vy: 0.0,
+            vz: 0.0,
+            yaw: 180.0,
+            pitch: 45.0,
+            on_ground: true,
+        });
+        roundtrip(EntityHeadRotation {
+            entity_id: 3,
+            head_yaw: -32,
+        });
+        roundtrip(EntityLook::from_degrees(3, 90.0, 45.0, true));
+        roundtrip(EntityMetadata {
+            entity_id: 3,
+            blob: vec![0x09, 0x03, 0x41],
+            // terminator byte 0xFF is part of the blob
+        });
+        let mut blob = EntityMetadata {
+            entity_id: 3,
+            blob: vec![0x09, 0x03, 0x41, 0xFF],
+        };
+        blob.blob.push(0xFF);
+        roundtrip(blob);
+        roundtrip(BundleDelimiter);
+        assert_eq!(degree_to_angle(180.0), -128);
+        assert_eq!(degree_to_angle(90.0), 64);
     }
 }

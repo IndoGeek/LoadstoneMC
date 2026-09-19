@@ -22,9 +22,11 @@ use loadstone_protocol::packets::login::{
     SetCompression,
 };
 use loadstone_protocol::packets::play::{
-    Abilities, ChunkBatchFinished, ChunkBatchReceived, ChunkBatchStart, ClientPosition, Experience,
-    MapChunk, PlayKeepAlive, PlayKeepAliveResponse, PlayLogin, PlayerInfoUpdate, ServerData,
-    SpawnPosition, SystemChat, TeleportConfirm, UpdateHealth, UpdateTime,
+    pack_position, Abilities, BlockChange, BlockDig, BlockPlace, BundleDelimiter,
+    ChunkBatchFinished, ChunkBatchReceived, ChunkBatchStart, ClientPosition, EntityMetadata,
+    Experience, MapChunk, PlayKeepAlive, PlayKeepAliveResponse, PlayLogin, PlayerInfoUpdate,
+    PlayerPosition, PlayerRemove, RemoveEntities, ServerData, SpawnEntity, SpawnPosition,
+    SyncEntityPosition, SystemChat, TeleportConfirm, UpdateHealth, UpdateTime, ENTITY_TYPE_PLAYER,
 };
 use loadstone_protocol::packets::Handshake;
 use loadstone_protocol::write_varint;
@@ -190,6 +192,51 @@ impl Client {
             .expect("timeout waiting for a packet")
     }
 
+    /// Reads the next meaningful Play packet, answering keep-alives and
+    /// skipping the metadata/delimiter noise that surrounds entity spawns.
+    async fn next_event(&mut self) -> (i32, Vec<u8>) {
+        loop {
+            let (id, body) = self.recv_timed().await;
+            if id == PlayKeepAlive::ID {
+                let alive = PlayKeepAlive::decode(&mut PacketReader::new(&body)).unwrap();
+                let mut writer = loadstone_protocol::PacketWriter::new();
+                PlayKeepAliveResponse {
+                    keep_alive_id: alive.keep_alive_id,
+                }
+                .encode(&mut writer);
+                self.send_packet(PlayKeepAliveResponse::ID, writer.as_slice())
+                    .await;
+                continue;
+            }
+            if id == EntityMetadata::ID || id == BundleDelimiter::ID {
+                continue;
+            }
+            return (id, body);
+        }
+    }
+
+    /// Reads until the given player's spawn appears (through the tab-list
+    /// bundle) and returns their entity id.
+    async fn await_player_spawn(&mut self, expected_uuid: Uuid) -> i32 {
+        loop {
+            let (id, body) = self.next_event().await;
+            if id == PlayerInfoUpdate::ID {
+                let info = PlayerInfoUpdate::decode(&mut PacketReader::new(&body)).unwrap();
+                if info.entries.iter().any(|entry| entry.uuid == expected_uuid) {
+                    continue;
+                }
+            } else if id == SpawnEntity::ID {
+                let spawn = SpawnEntity::decode(&mut PacketReader::new(&body)).unwrap();
+                if spawn.uuid == expected_uuid {
+                    assert_eq!(spawn.entity_type, ENTITY_TYPE_PLAYER);
+                    return spawn.entity_id;
+                }
+            } else {
+                panic!("unexpected play packet {id:#x} while awaiting a spawn");
+            }
+        }
+    }
+
     /// Drive the vanilla Configuration handshake and return the registries the
     /// server sent, as `(registry id, entry count)` in packet order.
     async fn complete_configuration(&mut self) -> Vec<(String, usize)> {
@@ -266,6 +313,7 @@ impl Client {
         let mut player_info = None;
         let mut health = None;
         let mut welcome = None;
+        let mut spawns = Vec::new();
         let mut ack_sent = false;
 
         loop {
@@ -304,10 +352,18 @@ impl Client {
                 }
                 id if id == PlayerInfoUpdate::ID => {
                     let info = PlayerInfoUpdate::decode(&mut PacketReader::new(&body)).unwrap();
-                    assert_eq!(info.entries.len(), 1);
-                    assert_eq!(info.entries[0].uuid, expected_uuid);
-                    player_info = Some(info);
+                    // The first tab entry is always the joining player; later
+                    // entries describe players who were already here.
+                    if player_info.is_none() {
+                        assert_eq!(info.entries.len(), 1);
+                        assert_eq!(info.entries[0].uuid, expected_uuid);
+                        player_info = Some(info);
+                    }
                 }
+                id if id == SpawnEntity::ID => {
+                    spawns.push(SpawnEntity::decode(&mut PacketReader::new(&body)).unwrap());
+                }
+                id if id == EntityMetadata::ID || id == BundleDelimiter::ID => {}
                 id if id == Abilities::ID => {}
                 id if id == UpdateHealth::ID => {
                     health = Some(UpdateHealth::decode(&mut PacketReader::new(&body)).unwrap());
@@ -351,7 +407,89 @@ impl Client {
             position: position.unwrap(),
             health: health.unwrap(),
             welcome: welcome.unwrap(),
+            spawns,
         }
+    }
+    /// Breaks and places single blocks around the spawn, asserting the server
+    /// replies with the matching S->C BlockChange packets. Bedrock edits must
+    /// receive no answer at all.
+    async fn mutate_world(&mut self) {
+        // Break the grass block just below the spawn point.
+        let mut writer = loadstone_protocol::PacketWriter::new();
+        BlockDig {
+            status: 2,
+            location: pack_position(8, 64, 8),
+            face: 1,
+            sequence: 1,
+        }
+        .encode(&mut writer);
+        self.send_packet(BlockDig::ID, writer.as_slice()).await;
+
+        let (id, body) = self.recv_timed().await;
+        assert_eq!(id, BlockChange::ID);
+        let change = BlockChange::decode(&mut PacketReader::new(&body)).unwrap();
+        assert_eq!(change.location, pack_position(8, 64, 8));
+        assert_eq!(change.block_state, 0, "dig should clear the block to air");
+
+        // Place a block on the top face of the (now air) spot.
+        let mut writer = loadstone_protocol::PacketWriter::new();
+        BlockPlace {
+            hand: 0,
+            location: pack_position(8, 64, 8),
+            direction: 1,
+            cursor_x: 0.5,
+            cursor_y: 1.0,
+            cursor_z: 0.5,
+            inside_block: false,
+            world_border_hit: false,
+            sequence: 2,
+        }
+        .encode(&mut writer);
+        self.send_packet(BlockPlace::ID, writer.as_slice()).await;
+
+        let (id, body) = self.recv_timed().await;
+        assert_eq!(id, BlockChange::ID);
+        let change = BlockChange::decode(&mut PacketReader::new(&body)).unwrap();
+        assert_eq!(change.location, pack_position(8, 65, 8));
+        assert_eq!(change.block_state, 14, "place should set cobblestone");
+
+        // Bedrock is unbreakable: expect radio silence from the server.
+        let mut writer = loadstone_protocol::PacketWriter::new();
+        BlockDig {
+            status: 2,
+            location: pack_position(0, -64, 0),
+            face: 0,
+            sequence: 3,
+        }
+        .encode(&mut writer);
+        self.send_packet(BlockDig::ID, writer.as_slice()).await;
+
+        let quiet = tokio::time::timeout(Duration::from_millis(700), self.recv_packet()).await;
+        match quiet {
+            Err(_) => {}
+            Ok((id, _)) => panic!("expected silence after digging bedrock, got packet {id:#x}"),
+        }
+    }
+
+    /// Sends a movement update with the on-ground flag set.
+    async fn send_position(&mut self, x: f64, y: f64, z: f64) {
+        let mut writer = loadstone_protocol::PacketWriter::new();
+        PlayerPosition { x, y, z, flags: 1 }.encode(&mut writer);
+        self.send_packet(PlayerPosition::ID, writer.as_slice())
+            .await;
+    }
+
+    /// Sends a finished block dig at the given coordinate.
+    async fn dig_block(&mut self, x: i32, y: i32, z: i32, sequence: i32) {
+        let mut writer = loadstone_protocol::PacketWriter::new();
+        BlockDig {
+            status: 2,
+            location: pack_position(x, y, z),
+            face: 1,
+            sequence,
+        }
+        .encode(&mut writer);
+        self.send_packet(BlockDig::ID, writer.as_slice()).await;
     }
 }
 
@@ -364,6 +502,7 @@ struct PlaySnapshot {
     position: ClientPosition,
     health: UpdateHealth,
     welcome: SystemChat,
+    spawns: Vec<SpawnEntity>,
 }
 
 fn read_varint(bytes: &[u8]) -> (u32, usize) {
@@ -385,6 +524,26 @@ async fn spawn_server(config: ConnectionConfig) -> (String, tokio::task::JoinHan
     let handle = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
         let _result = run_connection(stream, config).await;
+    });
+    (addr, handle)
+}
+
+/// Accepts any number of connections, each sharing the same server state. The
+/// returned handle runs until aborted.
+async fn spawn_server_multi(config: ConnectionConfig) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let handle = tokio::spawn(async move {
+        loop {
+            let (stream, _) = match listener.accept().await {
+                Ok(x) => x,
+                Err(_) => break,
+            };
+            let cfg = config.clone();
+            tokio::spawn(async move {
+                let _result = run_connection(stream, cfg).await;
+            });
+        }
     });
     (addr, handle)
 }
@@ -445,6 +604,32 @@ fn base_config(online_mode: bool) -> ConnectionConfig {
         online_mode,
         ..Default::default()
     }
+}
+
+/// Drives one offline client through login, configuration and into Play.
+async fn offline_join(addr: &str, name: &str) -> (Client, Uuid, PlaySnapshot) {
+    let mut client = Client::connect(addr).await;
+    client.handshake(2).await;
+    let uuid = client.login_start(name).await;
+
+    let (id, body) = tokio::time::timeout(Duration::from_secs(5), client.recv_packet())
+        .await
+        .expect("timeout waiting for set compression");
+    assert_eq!(id, SetCompression::ID);
+    let threshold = SetCompression::decode(&mut PacketReader::new(&body)).unwrap();
+    client.compression = Some(threshold.threshold);
+
+    let (id, body) = tokio::time::timeout(Duration::from_secs(5), client.recv_packet())
+        .await
+        .expect("timeout waiting for login success");
+    assert_eq!(id, LoginSuccess::ID);
+    let success = LoginSuccess::decode(&mut PacketReader::new(&body)).unwrap();
+    assert_eq!(success.uuid, uuid);
+
+    client.acknowledged().await;
+    client.complete_configuration().await;
+    let snapshot = client.enter_play(uuid).await;
+    (client, uuid, snapshot)
 }
 
 /// Answers the server's encryption request the way a vanilla client does: wrap a
@@ -574,12 +759,76 @@ async fn offline_login_reaches_play_state() {
     assert!(wire.contains("Welcome"), "got: {wire}");
     assert!(wire.contains("Alice"), "got: {wire}");
 
+    // The world is mutable: dig a block, place one back, and confirm edits echo.
+    client.mutate_world().await;
+
     // The client is dropped at the end of this function, so the server can exit.
     drop(client);
     tokio::time::timeout(Duration::from_secs(5), server)
         .await
         .expect("server did not finish play")
         .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn two_players_share_the_world() {
+    let (addr, server) = spawn_server_multi(base_config(false)).await;
+
+    // Alice is first: entity 0, no other players to spawn.
+    let (mut alice, alice_uuid, alice_snapshot) = offline_join(&addr, "Alice").await;
+    assert_eq!(alice_snapshot.login.entity_id, 0);
+    assert!(alice_snapshot.spawns.is_empty());
+
+    // Bob joins second and is shown Alice.
+    let (mut bob, bob_uuid, bob_snapshot) = offline_join(&addr, "Bob").await;
+    assert_eq!(bob_snapshot.login.entity_id, 1);
+    assert_eq!(bob_snapshot.spawns.len(), 1);
+    assert_eq!(bob_snapshot.spawns[0].uuid, alice_uuid);
+    assert_eq!(bob_snapshot.spawns[0].entity_id, 0);
+
+    // Alice is told Bob joined and learns his entity id.
+    let bob_entity = alice.await_player_spawn(bob_uuid).await;
+    assert_eq!(bob_entity, 1);
+
+    // Bob's movement reaches Alice as a Sync Entity Position.
+    bob.send_position(9.0, 65.0, 8.5).await;
+    let (id, body) = alice.next_event().await;
+    assert_eq!(id, SyncEntityPosition::ID, "expected a movement sync");
+    let sync = SyncEntityPosition::decode(&mut PacketReader::new(&body)).unwrap();
+    assert_eq!(sync.entity_id, bob_entity);
+    assert_eq!(sync.x, 9.0);
+    assert_eq!(sync.y, 65.0);
+    assert_eq!(sync.z, 8.5);
+    assert!(sync.on_ground);
+
+    // Bob breaks a block: he gets the authoritative echo and Alice sees it too.
+    bob.dig_block(8, 64, 8, 1).await;
+    let (id, body) = bob.next_event().await;
+    assert_eq!(id, BlockChange::ID);
+    let echo = BlockChange::decode(&mut PacketReader::new(&body)).unwrap();
+    assert_eq!(echo.location, pack_position(8, 64, 8));
+    assert_eq!(echo.block_state, 0);
+
+    let (id, body) = alice.next_event().await;
+    assert_eq!(id, BlockChange::ID, "expected the shared block change");
+    let shared = BlockChange::decode(&mut PacketReader::new(&body)).unwrap();
+    assert_eq!(shared.location, pack_position(8, 64, 8));
+    assert_eq!(shared.block_state, 0);
+
+    // Bob disconnects: Alice is told to remove the tab entry and the entity.
+    drop(bob);
+    let (id, body) = alice.next_event().await;
+    assert_eq!(id, PlayerRemove::ID);
+    let removed = PlayerRemove::decode(&mut PacketReader::new(&body)).unwrap();
+    assert!(removed.players.contains(&bob_uuid));
+
+    let (id, body) = alice.next_event().await;
+    assert_eq!(id, RemoveEntities::ID);
+    let gone = RemoveEntities::decode(&mut PacketReader::new(&body)).unwrap();
+    assert!(gone.entity_ids.contains(&bob_entity));
+
+    drop(alice);
+    server.abort();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -621,6 +870,7 @@ async fn online_login_negotiates_encryption_and_session() {
     let snapshot = client.enter_play(play_uuid).await;
     assert_eq!(snapshot.position.x, 8.5);
     assert_eq!(snapshot.health.health, 20.0);
+    client.mutate_world().await;
 
     drop(client);
     tokio::time::timeout(Duration::from_secs(5), server)

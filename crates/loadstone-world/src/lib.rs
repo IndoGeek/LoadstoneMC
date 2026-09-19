@@ -1,6 +1,9 @@
 //! World model, chunk storage and (eventually) Anvil region I/O.
 
 pub mod encode;
+pub mod world;
+
+pub use world::World;
 
 pub const CHUNK_SIZE_X: usize = 16;
 pub const CHUNK_SIZE_Z: usize = 16;

@@ -1,35 +1,52 @@
 //! The Play state: spawns the player on a small flat platform and runs the
-//! in-game loop (keep-alive, ping/pong, chat echo) until disconnect.
+//! in-game loop. Every connection shares one [`World`] and one player registry,
+//! so joins, movements, block edits and disconnects are broadcast to everyone.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use loadstone_protocol::packets::play::{
-    pack_position, Abilities, ChatMessage, ChunkBatchFinished, ChunkBatchReceived, ChunkBatchStart,
-    ChunkBlockEntity, ClientPosition, Experience, MapChunk, PingRequest, PlayKeepAlive,
-    PlayKeepAliveResponse, PlayLogin, PlayPong, PlayPongResponse, PlayerInfoEntry,
-    PlayerInfoUpdate, SpawnInfo, SpawnPosition, SystemChat, TeleportConfirm, UpdateHealth,
-    UpdateTime, PLAYER_INFO_ADD_PLAYER, PLAYER_INFO_UPDATE_GAME_MODE, PLAYER_INFO_UPDATE_LATENCY,
-    PLAYER_INFO_UPDATE_LISTED,
+    degree_to_angle, pack_position, unpack_position, Abilities, BlockChange, BlockDig, BlockPlace,
+    BundleDelimiter, ChatMessage, ChunkBatchFinished, ChunkBatchReceived, ChunkBatchStart,
+    ChunkBlockEntity, ClientPosition, EntityHeadRotation, EntityLook, EntityMetadata, Experience,
+    MapChunk, MovementFlags, PingRequest, PlayKeepAlive, PlayKeepAliveResponse, PlayLogin,
+    PlayPong, PlayPongResponse, PlayerInfoEntry, PlayerInfoUpdate, PlayerLook, PlayerPosition,
+    PlayerPositionLook, PlayerRemove, RemoveEntities, SpawnEntity, SpawnInfo, SpawnPosition,
+    SyncEntityPosition, SystemChat, TeleportConfirm, UpdateHealth, UpdateTime,
 };
 use loadstone_protocol::Nbt;
 use loadstone_protocol::{Packet, PacketReader, PacketWriter};
-use loadstone_world::encode as world;
+use loadstone_world::encode::{self, BLOCK_AIR, BLOCK_COBBLESTONE};
+use tokio::sync::mpsc;
 use tracing::{debug, info};
 use uuid::Uuid;
 
-use crate::connection::Connection;
+use crate::connection::{Connection, ConnectionConfig};
 use crate::error::NetError;
 
 /// The initial chunk-view radius (view distance 1 sends a 3x3 area).
 const VIEW_DISTANCE: i32 = 1;
 const SIMULATION_DISTANCE: i32 = 1;
-const ENTITY_ID: i32 = 0;
 /// Uniform keep-alive interval while the player is in the game.
 const KEEP_ALIVE_PERIOD: Duration = Duration::from_secs(5);
 
 const HEIGHTMAP_WORLD_SURFACE: i32 = 1;
 const HEIGHTMAP_MOTION_BLOCKING: i32 = 4;
 const HEIGHTMAP_MOTION_BLOCKING_NO_LEAVES: i32 = 5;
+
+/// Metadata blob that tells other clients to render every skin layer:
+/// index 9 (`PLAYER_MODE_CUSTOMISATION`), type 3 (byte), value `0x7F`, end.
+const PLAYER_SKIN_METADATA: [u8; 4] = [0x09, 0x03, 0x7F, 0xFF];
+
+/// The cast-face directional offsets in the order the protocol numbers them:
+/// bottom, top, north, south, west, east.
+const FACE_OFFSETS: [(i32, i32, i32); 6] = [
+    (0, -1, 0),
+    (0, 1, 0),
+    (0, 0, -1),
+    (0, 0, 1),
+    (-1, 0, 0),
+    (1, 0, 0),
+];
 
 fn encode_body<P: Packet>(packet: &P) -> Vec<u8> {
     let mut writer = PacketWriter::with_capacity(64);
@@ -41,8 +58,81 @@ fn text(message: &str) -> Vec<u8> {
     Nbt::text(message).to_anonymous_bytes()
 }
 
+/// A snapshot of a player who was already in the world when a newcomer joined.
+struct ExistingPlayer {
+    uuid: Uuid,
+    name: String,
+    entity_id: i32,
+    x: f64,
+    y: f64,
+    z: f64,
+    yaw: f32,
+    pitch: f32,
+}
+
 /// Runs the Play state for a player that just finished Configuration.
-pub async fn play_phase(mut conn: Connection, uuid: Uuid, username: &str) -> Result<(), NetError> {
+///
+/// The player is registered in the shared server state before the spawn
+/// sequence, so others can see them; they are removed and announced on every
+/// exit path.
+pub async fn play_phase(
+    conn: Connection,
+    uuid: Uuid,
+    username: &str,
+    config: &ConnectionConfig,
+) -> Result<(), NetError> {
+    let (out, rx) = mpsc::unbounded_channel();
+
+    let (entity_id, existing) = {
+        let mut state = config.state.lock().unwrap();
+        let entity_id = state.next_entity_id;
+        state.next_entity_id += 1;
+        state.players.insert(
+            uuid,
+            crate::connection::SharedPlayer {
+                entity_id,
+                name: username.to_string(),
+                x: encode::SPAWN_X,
+                y: encode::SPAWN_Y,
+                z: encode::SPAWN_Z,
+                yaw: 0.0,
+                pitch: 0.0,
+                out,
+            },
+        );
+        let existing = state
+            .players
+            .iter()
+            .filter(|(id, _)| **id != uuid)
+            .map(|(id, player)| ExistingPlayer {
+                uuid: *id,
+                name: player.name.clone(),
+                entity_id: player.entity_id,
+                x: player.x,
+                y: player.y,
+                z: player.z,
+                yaw: player.yaw,
+                pitch: player.pitch,
+            })
+            .collect();
+        (entity_id, existing)
+    };
+
+    let result = run_play(conn, uuid, username, config, entity_id, existing, rx).await;
+    leave_world(config, uuid, entity_id);
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_play(
+    mut conn: Connection,
+    uuid: Uuid,
+    username: &str,
+    config: &ConnectionConfig,
+    entity_id: i32,
+    existing: Vec<ExistingPlayer>,
+    rx: mpsc::UnboundedReceiver<(i32, Vec<u8>)>,
+) -> Result<(), NetError> {
     let dimension_id =
         loadstone_registry::runtime_id("minecraft:dimension_type", "minecraft:overworld")
             .ok_or_else(|| {
@@ -54,16 +144,16 @@ pub async fn play_phase(mut conn: Connection, uuid: Uuid, username: &str) -> Res
     })?;
     let biome_id = biome_id as u32;
 
-    let world_origin = world::flat_chunk(0, 0);
-    let heights = world::column_heights(&world_origin);
-    let heightmap_data = world::pack_heightmap(&heights, world::WORLD_HEIGHT);
-    let chunk_data = world::encode_chunk_column(&world_origin, biome_id);
-    let sky_light = world::full_sky_light(24);
+    let world_origin = encode::flat_chunk(0, 0);
+    let heights = encode::column_heights(&world_origin);
+    let heightmap_data = encode::pack_heightmap(&heights, encode::WORLD_HEIGHT);
+    let chunk_data = encode::encode_chunk_column(&world_origin, biome_id);
+    let sky_light = encode::full_sky_light(24);
     let sky_light_mask = vec![((1 << 24) - 1) as i64];
 
     // 1. Login: dimension, spawn info and world rendering settings.
     let login = PlayLogin {
-        entity_id: ENTITY_ID,
+        entity_id,
         is_hardcore: false,
         world_names: vec!["minecraft:overworld".to_string()],
         max_players: 20,
@@ -95,7 +185,7 @@ pub async fn play_phase(mut conn: Connection, uuid: Uuid, username: &str) -> Res
     // before leaving the "downloading terrain" screen.
     let spawn_pos = SpawnPosition {
         dimension_name: "minecraft:overworld".to_string(),
-        position: pack_position(0, world::GRASS_TOP_Y + 1, 0),
+        position: pack_position(0, encode::GRASS_TOP_Y + 1, 0),
         yaw: 0.0,
         pitch: 0.0,
     };
@@ -139,33 +229,26 @@ pub async fn play_phase(mut conn: Connection, uuid: Uuid, username: &str) -> Res
     conn.write_packet(ChunkBatchFinished::ID, &body).await?;
 
     // 3. Place the player at the spawn point and introduce them in the tab list.
-    let teleport =
-        ClientPosition::absolute(0, world::SPAWN_X, world::SPAWN_Y, world::SPAWN_Z, 0.0, 0.0);
+    let teleport = ClientPosition::absolute(
+        0,
+        encode::SPAWN_X,
+        encode::SPAWN_Y,
+        encode::SPAWN_Z,
+        0.0,
+        0.0,
+    );
     let body = encode_body(&teleport);
     conn.write_packet(ClientPosition::ID, &body).await?;
 
-    let player_info = PlayerInfoUpdate {
-        entries: vec![PlayerInfoEntry {
-            uuid,
-            name: username.to_string(),
-            properties: Vec::new(),
-            gamemode: Some(0),
-            listed: Some(1),
-            latency: Some(0),
-            display_name: None,
-            list_priority: None,
-            show_hat: None,
-        }],
-    };
-    let action_mask: u8 = PLAYER_INFO_ADD_PLAYER
-        | PLAYER_INFO_UPDATE_GAME_MODE
-        | PLAYER_INFO_UPDATE_LISTED
-        | PLAYER_INFO_UPDATE_LATENCY;
-    debug!(actions = action_mask, "sending player info update");
-    let body = encode_body(&player_info);
+    let body = encode_body(&player_info_add(uuid, username));
     conn.write_packet(PlayerInfoUpdate::ID, &body).await?;
 
-    // 4. Core gameplay state the client expects right after joining.
+    // 4. Introduce the players who were already here, in one atomic bundle.
+    send_existing_players(&mut conn, &existing).await?;
+    // And tell everyone else that this player joined.
+    broadcast_join(config, uuid, entity_id, username);
+
+    // 5. Core gameplay state the client expects right after joining.
     let abilities = Abilities {
         flags: 0x05, // invulnerable | allow flying
         flying_speed: 0.05,
@@ -217,59 +300,349 @@ pub async fn play_phase(mut conn: Connection, uuid: Uuid, username: &str) -> Res
     let body = encode_body(&welcome);
     conn.write_packet(SystemChat::ID, &body).await?;
 
-    info!(name = %username, "player entered the world");
-    play_loop(&mut conn, username).await
+    info!(name = %username, entity_id, "player entered the world");
+    play_loop(&mut conn, uuid, username, config, rx).await
 }
 
-/// The in-game packet loop. The client pushes keep-alives, pings, chat and
-/// movement; the server replies and echoes chat back.
-async fn play_loop(conn: &mut Connection, username: &str) -> Result<(), NetError> {
+/// A tab-list "add player" entry with the fields we always populate.
+fn player_info_add(uuid: Uuid, name: &str) -> PlayerInfoUpdate {
+    PlayerInfoUpdate {
+        entries: vec![PlayerInfoEntry {
+            uuid,
+            name: name.to_string(),
+            properties: Vec::new(),
+            gamemode: Some(0),
+            listed: Some(1),
+            latency: Some(0),
+            display_name: None,
+            list_priority: None,
+            show_hat: None,
+        }],
+    }
+}
+
+/// The packets that introduce a player to a client: tab entry, spawn and the
+/// skin-layer metadata. Sent inside a bundle delimiter pair.
+async fn send_existing_players(
+    conn: &mut Connection,
+    existing: &[ExistingPlayer],
+) -> Result<(), NetError> {
+    if existing.is_empty() {
+        return Ok(());
+    }
+    let delimiter = encode_body(&BundleDelimiter);
+    conn.write_packet(BundleDelimiter::ID, &delimiter).await?;
+    for player in existing {
+        let body = encode_body(&player_info_add(player.uuid, &player.name));
+        conn.write_packet(PlayerInfoUpdate::ID, &body).await?;
+        let spawn = SpawnEntity::player(
+            player.entity_id,
+            player.uuid,
+            player.x,
+            player.y,
+            player.z,
+            player.yaw,
+            player.pitch,
+        );
+        let body = encode_body(&spawn);
+        conn.write_packet(SpawnEntity::ID, &body).await?;
+        conn.write_packet(EntityMetadata::ID, &skin_metadata(player.entity_id))
+            .await?;
+    }
+    conn.write_packet(BundleDelimiter::ID, &delimiter).await?;
+    Ok(())
+}
+
+fn skin_metadata(entity_id: i32) -> Vec<u8> {
+    encode_body(&EntityMetadata {
+        entity_id,
+        blob: PLAYER_SKIN_METADATA.to_vec(),
+    })
+}
+
+/// Pushes this player's tab entry, spawn and metadata to every other player.
+fn broadcast_join(config: &ConnectionConfig, uuid: Uuid, entity_id: i32, username: &str) {
+    let spawn = SpawnEntity::player(
+        entity_id,
+        uuid,
+        encode::SPAWN_X,
+        encode::SPAWN_Y,
+        encode::SPAWN_Z,
+        0.0,
+        0.0,
+    );
+    let frames = [
+        (BundleDelimiter::ID, encode_body(&BundleDelimiter)),
+        (
+            PlayerInfoUpdate::ID,
+            encode_body(&player_info_add(uuid, username)),
+        ),
+        (SpawnEntity::ID, encode_body(&spawn)),
+        (EntityMetadata::ID, skin_metadata(entity_id)),
+        (BundleDelimiter::ID, encode_body(&BundleDelimiter)),
+    ];
+
+    let state = config.state.lock().unwrap();
+    for (id, player) in &state.players {
+        if *id == uuid {
+            continue;
+        }
+        for (packet_id, body) in &frames {
+            let _ = player.out.send((*packet_id, body.clone()));
+        }
+    }
+}
+
+/// Removes a player from the registry and tells everyone else they left.
+fn leave_world(config: &ConnectionConfig, uuid: Uuid, entity_id: i32) {
+    let mut state = config.state.lock().unwrap();
+    state.players.remove(&uuid);
+
+    let remove_tab = encode_body(&PlayerRemove {
+        players: vec![uuid],
+    });
+    let remove_entity = encode_body(&RemoveEntities {
+        entity_ids: vec![entity_id],
+    });
+    for player in state.players.values() {
+        let _ = player.out.send((PlayerRemove::ID, remove_tab.clone()));
+        let _ = player.out.send((RemoveEntities::ID, remove_entity.clone()));
+    }
+}
+
+/// Sends one already-encoded packet to every player except `source`.
+fn broadcast_except(config: &ConnectionConfig, source: Uuid, packet_id: i32, body: Vec<u8>) {
+    let state = config.state.lock().unwrap();
+    for (uuid, player) in &state.players {
+        if *uuid == source {
+            continue;
+        }
+        let _ = player.out.send((packet_id, body.clone()));
+    }
+}
+
+/// Applies a movement to the registry and returns the resulting
+/// `(entity_id, x, y, z, yaw, pitch)` for the broadcast.
+fn record_movement(
+    config: &ConnectionConfig,
+    uuid: Uuid,
+    pos: Option<(f64, f64, f64)>,
+    look: Option<(f32, f32)>,
+) -> Option<(i32, f64, f64, f64, f32, f32)> {
+    let mut state = config.state.lock().unwrap();
+    let player = state.players.get_mut(&uuid)?;
+    if let Some((x, y, z)) = pos {
+        player.x = x;
+        player.y = y;
+        player.z = z;
+    }
+    if let Some((yaw, pitch)) = look {
+        player.yaw = yaw;
+        player.pitch = pitch;
+    }
+    Some((
+        player.entity_id,
+        player.x,
+        player.y,
+        player.z,
+        player.yaw,
+        player.pitch,
+    ))
+}
+
+/// The in-game packet loop. Reads from the client, replies to keep-alives and
+/// pings, applies movement/block edits to the shared world, and flushes packets
+/// pushed by other connections.
+async fn play_loop(
+    conn: &mut Connection,
+    uuid: Uuid,
+    username: &str,
+    config: &ConnectionConfig,
+    mut rx: mpsc::UnboundedReceiver<(i32, Vec<u8>)>,
+) -> Result<(), NetError> {
     let mut keep_alive_id: i64 = 1;
+    let mut deadline = tokio::time::Instant::now() + KEEP_ALIVE_PERIOD;
 
     loop {
-        let frame = match tokio::time::timeout(KEEP_ALIVE_PERIOD, conn.read_packet()).await {
-            Ok(result) => result?,
-            Err(_) => {
-                // Timeout: push a keep-alive probe and continue waiting.
+        tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => {
+                deadline = tokio::time::Instant::now() + KEEP_ALIVE_PERIOD;
                 let body = encode_body(&PlayKeepAlive { keep_alive_id });
                 conn.write_packet(PlayKeepAlive::ID, &body).await?;
                 keep_alive_id = keep_alive_id.wrapping_add(1);
-                continue;
             }
-        };
-
-        match frame.id {
-            id if id == PlayKeepAliveResponse::ID => {
-                let _ = PlayKeepAliveResponse::decode(&mut PacketReader::new(&frame.body))?;
-                debug!(name = %username, "kept alive");
+            outgoing = rx.recv() => {
+                match outgoing {
+                    Some((id, body)) => conn.write_packet(id, &body).await?,
+                    None => break,
+                }
             }
-            id if id == PingRequest::ID => {
-                let ping = PingRequest::decode(&mut PacketReader::new(&frame.body))?;
-                let body = encode_body(&PlayPong { id: ping.id });
-                conn.write_packet(PlayPong::ID, &body).await?;
-            }
-            id if id == PlayPongResponse::ID => {
-                let pong = PlayPongResponse::decode(&mut PacketReader::new(&frame.body))?;
-                debug!(name = %username, id = pong.id, "pong received");
-            }
-            id if id == TeleportConfirm::ID => {
-                let _ = TeleportConfirm::decode(&mut PacketReader::new(&frame.body))?;
-            }
-            id if id == ChatMessage::ID => {
-                let chat = ChatMessage::decode(&mut PacketReader::new(&frame.body))?;
-                info!(name = %username, message = %chat.message, "chat");
-                let echo = SystemChat {
-                    content: text(&format!("<{}> {}", username, chat.message)),
-                    is_action_bar: false,
-                };
-                let body = encode_body(&echo);
-                conn.write_packet(SystemChat::ID, &body).await?;
-            }
-            _ => {
-                // Movement, abilities, chunk acks and the like: nothing to do on
-                // a flat, unchanging world.
-                debug!(name = %username, id = frame.id, "ignoring play packet");
+            frame = conn.read_packet() => {
+                let frame = frame?;
+                handle_frame(conn, uuid, username, config, frame).await?;
             }
         }
     }
+
+    Ok(())
+}
+
+async fn handle_frame(
+    conn: &mut Connection,
+    uuid: Uuid,
+    username: &str,
+    config: &ConnectionConfig,
+    frame: crate::connection::RawPacket,
+) -> Result<(), NetError> {
+    match frame.id {
+        id if id == PlayKeepAliveResponse::ID => {
+            let _ = PlayKeepAliveResponse::decode(&mut PacketReader::new(&frame.body))?;
+            debug!(name = %username, "kept alive");
+        }
+        id if id == PingRequest::ID => {
+            let ping = PingRequest::decode(&mut PacketReader::new(&frame.body))?;
+            let body = encode_body(&PlayPong { id: ping.id });
+            conn.write_packet(PlayPong::ID, &body).await?;
+        }
+        id if id == PlayPongResponse::ID => {
+            let pong = PlayPongResponse::decode(&mut PacketReader::new(&frame.body))?;
+            debug!(name = %username, id = pong.id, "pong received");
+        }
+        id if id == TeleportConfirm::ID => {
+            let _ = TeleportConfirm::decode(&mut PacketReader::new(&frame.body))?;
+        }
+        id if id == ChatMessage::ID => {
+            let chat = ChatMessage::decode(&mut PacketReader::new(&frame.body))?;
+            info!(name = %username, message = %chat.message, "chat");
+            let echo = SystemChat {
+                content: text(&format!("<{}> {}", username, chat.message)),
+                is_action_bar: false,
+            };
+            let body = encode_body(&echo);
+            conn.write_packet(SystemChat::ID, &body).await?;
+            broadcast_except(config, uuid, SystemChat::ID, body);
+        }
+        id if id == PlayerPosition::ID => {
+            let movement = PlayerPosition::decode(&mut PacketReader::new(&frame.body))?;
+            let on_ground = movement.flags & MovementFlags::ON_GROUND != 0;
+            sync_entity_position(
+                config,
+                uuid,
+                Some((movement.x, movement.y, movement.z)),
+                None,
+                on_ground,
+            );
+        }
+        id if id == PlayerPositionLook::ID => {
+            let movement = PlayerPositionLook::decode(&mut PacketReader::new(&frame.body))?;
+            let on_ground = movement.flags & MovementFlags::ON_GROUND != 0;
+            sync_entity_position(
+                config,
+                uuid,
+                Some((movement.x, movement.y, movement.z)),
+                Some((movement.yaw, movement.pitch)),
+                on_ground,
+            );
+        }
+        id if id == PlayerLook::ID => {
+            let movement = PlayerLook::decode(&mut PacketReader::new(&frame.body))?;
+            let on_ground = movement.flags & MovementFlags::ON_GROUND != 0;
+            if let Some((entity_id, _, _, _, yaw, pitch)) =
+                record_movement(config, uuid, None, Some((movement.yaw, movement.pitch)))
+            {
+                let look = EntityLook::from_degrees(entity_id, yaw, pitch, on_ground);
+                broadcast_except(config, uuid, EntityLook::ID, encode_body(&look));
+
+                let head = EntityHeadRotation {
+                    entity_id,
+                    head_yaw: degree_to_angle(yaw),
+                };
+                broadcast_except(config, uuid, EntityHeadRotation::ID, encode_body(&head));
+            }
+        }
+        id if id == BlockDig::ID => {
+            let dig = BlockDig::decode(&mut PacketReader::new(&frame.body))?;
+            let (x, y, z) = unpack_position(dig.location);
+            debug!(name = %username, status = dig.status, x, y, z, "block dig");
+            // Status 2 marks a finished dig; the block is removed.
+            if dig.status == 2 {
+                let broken = {
+                    let mut world = config.world.lock().unwrap();
+                    if world.is_breakable(x, y, z) {
+                        world.set_block(x, y, z, BLOCK_AIR);
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if broken {
+                    let body = encode_body(&BlockChange {
+                        location: dig.location,
+                        block_state: i32::from(BLOCK_AIR),
+                    });
+                    conn.write_packet(BlockChange::ID, &body).await?;
+                    broadcast_except(config, uuid, BlockChange::ID, body);
+                }
+            }
+        }
+        id if id == BlockPlace::ID => {
+            let place = BlockPlace::decode(&mut PacketReader::new(&frame.body))?;
+            let (x, y, z) = unpack_position(place.location);
+            let (dx, dy, dz) = FACE_OFFSETS[place.direction as usize % FACE_OFFSETS.len()];
+            let (tx, ty, tz) = (x + dx, y + dy, z + dz);
+            debug!(name = %username, x = tx, y = ty, z = tz, "block place");
+            let placed = {
+                let mut world = config.world.lock().unwrap();
+                if world.is_empty(tx, ty, tz) {
+                    world.set_block(tx, ty, tz, BLOCK_COBBLESTONE);
+                    true
+                } else {
+                    false
+                }
+            };
+            if placed {
+                let location = pack_position(tx, ty, tz);
+                let body = encode_body(&BlockChange {
+                    location,
+                    block_state: i32::from(BLOCK_COBBLESTONE),
+                });
+                conn.write_packet(BlockChange::ID, &body).await?;
+                broadcast_except(config, uuid, BlockChange::ID, body);
+            }
+        }
+        _ => {
+            // Abilities, chunk acks, player-loaded and the like: nothing to do.
+            debug!(name = %username, id = frame.id, "ignoring play packet");
+        }
+    }
+
+    Ok(())
+}
+
+/// Updates the registry with a movement and broadcasts the resulting absolute
+/// position/velocity to every other player. The mover keeps predicting its own
+/// position, so it receives nothing back.
+fn sync_entity_position(
+    config: &ConnectionConfig,
+    uuid: Uuid,
+    pos: Option<(f64, f64, f64)>,
+    look: Option<(f32, f32)>,
+    on_ground: bool,
+) {
+    let Some((entity_id, x, y, z, yaw, pitch)) = record_movement(config, uuid, pos, look) else {
+        return;
+    };
+    let sync = SyncEntityPosition {
+        entity_id,
+        x,
+        y,
+        z,
+        vx: 0.0,
+        vy: 0.0,
+        vz: 0.0,
+        yaw,
+        pitch,
+        on_ground,
+    };
+    broadcast_except(config, uuid, SyncEntityPosition::ID, encode_body(&sync));
 }

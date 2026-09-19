@@ -48,6 +48,7 @@ async fn main() -> anyhow::Result<()> {
         online_players: 0,
         online_mode: args.online_mode,
         sessionserver_url: args.sessionserver_url,
+        ..Default::default()
     };
 
     let listener = TcpListener::bind(&args.bind)
