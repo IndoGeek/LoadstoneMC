@@ -18,4 +18,6 @@ pub enum NetError {
     InvalidVerifyToken,
     #[error("authentication error: {0}")]
     Auth(String),
+    #[error("internal server error: {0}")]
+    Internal(String),
 }

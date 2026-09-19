@@ -182,10 +182,11 @@ impl Packet for RegistryData {
             out.write_string(&entry.name);
             match &entry.data {
                 Some(data) => {
-                    out.write_bool(true).write_bytes(data);
+                    out.write_bytes(data);
                 }
                 None => {
-                    out.write_bool(false);
+                    // Absent optional NBT is a bare TAG_End byte.
+                    out.write_u8(0);
                 }
             }
         }
@@ -200,11 +201,7 @@ impl Packet for RegistryData {
         let mut entries = Vec::with_capacity(count as usize);
         for _ in 0..count {
             let name = reader.read_string()?.to_string();
-            let data = if reader.read_bool()? {
-                Some(reader.read_rest().to_vec())
-            } else {
-                None
-            };
+            let data = reader.read_anonymous_nbt()?.map(ToOwned::to_owned);
             entries.push(RegistryEntry { name, data });
         }
         Ok(Self {

@@ -13,13 +13,18 @@ small, fast, low-overhead core in the spirit of Pumpkin and Steel.
 | Login, offline mode | works |
 | Login, online mode (RSA key exchange, AES-128/CFB8, Mojang `hasJoined`, compression) | works |
 | Configuration state (known packs, feature flags, registry data, tags, finish) | works |
-| Play state (world, chunks, entities, chat) | not implemented |
+| Play state (login, world spawn, 3x3 chunk batch, position, keep-alive, chat echo) | works |
+| Entities, movement, worldgen, persistence | not implemented |
 
 A vanilla client can ping the server, complete login, and finish the whole
 Configuration handshake: it negotiates `minecraft:core`, receives every
-synchronized registry and network tag, and acknowledges Finish Configuration.
-The server has no Play state yet, so it closes at the Play boundary and the
-player stops at "Joining world".
+synchronized registry and network tag, acknowledges Finish Configuration, and
+then spawns onto a flat 3x3 platform in the Overworld. The Play state sends the
+world spawn and chunk batch (with heightmaps and full-bright sky light),
+acknowledges the chunk batch, teleports the player to spawn, enters the tab
+list, and runs keep-alive, ping/pong, teleport confirmations and chat echo
+(including the Mojang-signed session key chain on online mode) until the client
+disconnects.
 
 ## Build and run
 
@@ -51,7 +56,7 @@ Logging is controlled by `RUST_LOG` (for example `RUST_LOG=loadstone=debug`).
 |---|---|
 | `loadstone-protocol` | Packet definitions, VarInt, packet reader/writer, compression |
 | `loadstone-net` | Connection lifecycle, framing, AES-128/CFB8, login flow, session auth |
-| `loadstone-world` | Placeholder — chunk storage and world state |
+| `loadstone-world` | Flat-world chunk templates and the 1.21.11 chunk wire format (paletted containers, heightmaps, sky light) |
 | `loadstone-registry` | Synchronized registry and network tag data (embedded JSON) |
 | `loadstone-server` | The `loadstone` binary: CLI, listener, per-connection tasks |
 
@@ -74,11 +79,15 @@ cargo fmt --all --check
 ```
 
 `crates/loadstone-net/tests/login_flow.rs` starts a real listener and drives the
-whole login handshake through to the end of Configuration, including online mode
-against a local mock session server, so no Mojang account or network access is
-needed. It asserts the server offers `minecraft:core`, sends all 23 synchronized
-registries with their NBT omitted, and finishes configuration when the client
-acknowledges.
+whole login handshake through Configuration and into the Play state, including
+online mode against a local mock session server, so no Mojang account or network
+access is needed. It asserts the server offers `minecraft:core`, sends all 23
+synchronized registries with their NBT omitted, finishes configuration when the
+client acknowledges, and then spawns a simulated player: it checks the Play login
+packet's dimension/spawn info, the 3x3 chunk batch (ultra-precise heightmaps,
+non-empty chunk data), the spawn position, the teleport to (8.5, 65.0, 8.5),
+full health/hunger, the tab list entry, and the welcome chat line carrying the
+player's name.
 
 `tools/live_login_check.py` does the same over a socket against a real running
 binary, with a client written independently of the server (Python `cryptography`):
@@ -90,10 +99,10 @@ python3 tools/live_login_check.py --no-spawn --port 25565
 ```
 
 It covers the server list ping, an offline login, an online login (key exchange
-→ AES/CFB8 → `hasJoined` → compression → Login Success → acknowledgement), and
-both online-mode refusals: an unverified account, and a key exchange that does
-not echo the verify token. Exit status is non-zero if anything fails, so it can
-gate a release.
+→ AES/CFB8 → `hasJoined` → compression → Login Success → acknowledgement → the
+full Configuration handshake → the Play state) and both online-mode refusals: an
+unverified account, and a key exchange that does not echo the verify token. Exit
+status is non-zero if anything fails, so it can gate a release.
 
 ## Protocol notes
 
@@ -125,12 +134,12 @@ gate a release.
 
 ## Roadmap
 
-1. **Play state** — Login (play), chunk data, player position, keep-alive, chat
-   (including verifying the Mojang-signed session key chain). This is what makes
-   the player actually spawn in.
-2. **World** — chunk format on the wire and on disk, generation, persistence.
-3. **Custom registries** — the current data is the vanilla set with NBT omitted;
+1. **Game feel** — entities, movement, block placement, custom world generation
+   and persistence. The flat 3x3 demo world gets replaced with real chunks.
+2. **Custom registries** — the current data is the vanilla set with NBT omitted;
    serving custom biomes/dimensions means emitting entry NBT as well.
+3. **Player data & chat** — verify the Mojang-signed session key chain for chat
+   on online mode, and persist players between sessions.
 
 ## License
 

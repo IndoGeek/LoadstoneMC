@@ -80,6 +80,18 @@ pub fn network_tags() -> &'static NetworkTags {
     })
 }
 
+/// The runtime id of `name` within a synchronized registry, i.e. its index in
+/// the protocol-ordered entry list. Used to send block/entity/registry ids in
+/// Play state packets (they are meaningless without the Configuration spin-up).
+pub fn runtime_id(registry_id: &str, name: &str) -> Option<i32> {
+    synced_registries()
+        .registries
+        .iter()
+        .find(|registry| registry.id == registry_id)
+        .and_then(|registry| registry.entries.iter().position(|entry| entry == name))
+        .map(|index| index as i32)
+}
+
 /// Minimal block registry: block state id -> properties.
 #[derive(Debug, Clone, Default)]
 pub struct BlockRegistry {

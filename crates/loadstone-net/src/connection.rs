@@ -138,7 +138,7 @@ impl Connection {
         self.compression_threshold = Some(threshold);
     }
 
-    async fn read_packet(&mut self) -> Result<RawPacket, NetError> {
+    pub(crate) async fn read_packet(&mut self) -> Result<RawPacket, NetError> {
         let InboundFrame { packet_id, payload } =
             read_frame(&mut self.transport, self.compression_threshold).await?;
         Ok(RawPacket {
@@ -147,7 +147,7 @@ impl Connection {
         })
     }
 
-    async fn write_packet(&mut self, id: i32, body: &[u8]) -> Result<(), NetError> {
+    pub(crate) async fn write_packet(&mut self, id: i32, body: &[u8]) -> Result<(), NetError> {
         write_frame(&mut self.transport, id, body, self.compression_threshold).await?;
         Ok(())
     }
@@ -199,10 +199,7 @@ pub async fn run_connection(stream: TcpStream, config: ConnectionConfig) -> Resu
         1 => status_phase(&mut conn, &config).await?,
         2 => {
             login_phase(conn, &handshake, &config).await?;
-            info!(
-                ?peer,
-                "connection finished: configuration complete, play state not implemented"
-            );
+            info!(?peer, "connection finished: play state ended");
         }
         other => {
             warn!(?peer, state = other, "unknown next state");
@@ -300,7 +297,7 @@ async fn login_phase(
         info!(name = %start.name, mode = "offline", "login complete");
         let username = start.name.clone();
         let conn = finish_login(conn, start.uuid, start.name).await?;
-        return configuration_phase(conn, &username).await;
+        return configuration_phase(conn, start.uuid, &username).await;
     }
 
     // Online mode: encryption + Mojang session verification.
@@ -371,7 +368,7 @@ async fn login_phase(
 
     let username = profile.name.clone();
     let conn = finish_login(conn, profile.uuid, profile.name).await?;
-    configuration_phase(conn, &username).await
+    configuration_phase(conn, profile.uuid, &username).await
 }
 
 async fn finish_login(
@@ -412,7 +409,11 @@ async fn finish_login(
 /// The server negotiates `minecraft:core` with the client and then sends every
 /// synchronized registry with its NBT omitted, so the client resolves entry
 /// data from its own data pack. Network tags are always sent in full.
-async fn configuration_phase(mut conn: Connection, username: &str) -> Result<(), NetError> {
+async fn configuration_phase(
+    mut conn: Connection,
+    uuid: uuid::Uuid,
+    username: &str,
+) -> Result<(), NetError> {
     let synced = loadstone_registry::synced_registries();
 
     // Vanilla opens the state with its brand and feature flags.
@@ -541,7 +542,9 @@ async fn configuration_phase(mut conn: Connection, username: &str) -> Result<(),
     }
 
     debug!(name = %username, "configuration complete");
-    Ok(())
+
+    debug!(name = %username, "entering play state");
+    crate::play::play_phase(conn, uuid, username).await
 }
 
 /// The `minecraft:brand` payload is a single length-prefixed string.

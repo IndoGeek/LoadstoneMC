@@ -21,6 +21,11 @@ use loadstone_protocol::packets::login::{
     EncryptionRequest, EncryptionResponse, LoginAcknowledged, LoginStart, LoginSuccess,
     SetCompression,
 };
+use loadstone_protocol::packets::play::{
+    Abilities, ChunkBatchFinished, ChunkBatchReceived, ChunkBatchStart, ClientPosition, Experience,
+    MapChunk, PlayKeepAlive, PlayKeepAliveResponse, PlayLogin, PlayerInfoUpdate, ServerData,
+    SpawnPosition, SystemChat, TeleportConfirm, UpdateHealth, UpdateTime,
+};
 use loadstone_protocol::packets::Handshake;
 use loadstone_protocol::write_varint;
 use loadstone_protocol::{Packet, PacketReader, PROTOCOL_VERSION};
@@ -248,6 +253,117 @@ impl Client {
         }
         registries
     }
+
+    /// Drive the Play state to completion: consume the login and spawn sequence,
+    /// acknowledge the chunk batch, and echo the post-join packets back to the
+    /// caller in a snapshot for assertions.
+    async fn enter_play(&mut self, expected_uuid: Uuid) -> PlaySnapshot {
+        let mut login: Option<PlayLogin> = None;
+        let mut spawn = None;
+        let mut chunks = Vec::new();
+        let mut batch = None;
+        let mut position = None;
+        let mut player_info = None;
+        let mut health = None;
+        let mut welcome = None;
+        let mut ack_sent = false;
+
+        loop {
+            if ack_sent
+                && login.is_some()
+                && spawn.is_some()
+                && chunks.len() >= 9
+                && batch.is_some()
+                && position.is_some()
+                && player_info.is_some()
+                && health.is_some()
+                && welcome.is_some()
+            {
+                break;
+            }
+
+            let (id, body) = self.recv_timed().await;
+            match id {
+                id if id == PlayLogin::ID => {
+                    login = Some(PlayLogin::decode(&mut PacketReader::new(&body)).unwrap());
+                }
+                id if id == SpawnPosition::ID => {
+                    spawn = Some(SpawnPosition::decode(&mut PacketReader::new(&body)).unwrap());
+                }
+                id if id == ChunkBatchStart::ID => {}
+                id if id == MapChunk::ID => {
+                    chunks.push(MapChunk::decode(&mut PacketReader::new(&body)).unwrap());
+                }
+                id if id == ChunkBatchFinished::ID => {
+                    batch =
+                        Some(ChunkBatchFinished::decode(&mut PacketReader::new(&body)).unwrap());
+                }
+                id if id == ClientPosition::ID => {
+                    position = Some(ClientPosition::decode(&mut PacketReader::new(&body)).unwrap());
+                    self.send_packet(TeleportConfirm::ID, &[0x00]).await;
+                }
+                id if id == PlayerInfoUpdate::ID => {
+                    let info = PlayerInfoUpdate::decode(&mut PacketReader::new(&body)).unwrap();
+                    assert_eq!(info.entries.len(), 1);
+                    assert_eq!(info.entries[0].uuid, expected_uuid);
+                    player_info = Some(info);
+                }
+                id if id == Abilities::ID => {}
+                id if id == UpdateHealth::ID => {
+                    health = Some(UpdateHealth::decode(&mut PacketReader::new(&body)).unwrap());
+                }
+                id if id == Experience::ID => {}
+                id if id == UpdateTime::ID => {}
+                id if id == ServerData::ID => {}
+                id if id == SystemChat::ID => {
+                    welcome = Some(SystemChat::decode(&mut PacketReader::new(&body)).unwrap());
+                }
+                id if id == PlayKeepAlive::ID => {
+                    let alive = PlayKeepAlive::decode(&mut PacketReader::new(&body)).unwrap();
+                    let mut writer = loadstone_protocol::PacketWriter::new();
+                    PlayKeepAliveResponse {
+                        keep_alive_id: alive.keep_alive_id,
+                    }
+                    .encode(&mut writer);
+                    self.send_packet(PlayKeepAliveResponse::ID, writer.as_slice())
+                        .await;
+                }
+                other => panic!("unexpected play packet {other:#x}"),
+            }
+
+            if !ack_sent && chunks.len() >= 9 {
+                let mut writer = loadstone_protocol::PacketWriter::new();
+                ChunkBatchReceived {
+                    chunks_per_tick: 10.0,
+                }
+                .encode(&mut writer);
+                self.send_packet(ChunkBatchReceived::ID, writer.as_slice())
+                    .await;
+                ack_sent = true;
+            }
+        }
+
+        PlaySnapshot {
+            login: login.unwrap(),
+            spawn: spawn.unwrap(),
+            chunks,
+            batch: batch.unwrap(),
+            position: position.unwrap(),
+            health: health.unwrap(),
+            welcome: welcome.unwrap(),
+        }
+    }
+}
+
+/// Everything the server sent while the client entered the world.
+struct PlaySnapshot {
+    login: PlayLogin,
+    spawn: SpawnPosition,
+    chunks: Vec<MapChunk>,
+    batch: ChunkBatchFinished,
+    position: ClientPosition,
+    health: UpdateHealth,
+    welcome: SystemChat,
 }
 
 fn read_varint(bytes: &[u8]) -> (u32, usize) {
@@ -372,7 +488,7 @@ async fn answer_encryption_request(client: &mut Client, token_override: Option<V
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn offline_login_reaches_configuration() {
+async fn offline_login_reaches_play_state() {
     let (addr, server) = spawn_server(base_config(false)).await;
 
     let mut client = Client::connect(&addr).await;
@@ -403,9 +519,66 @@ async fn offline_login_reaches_configuration() {
     assert!(registries.contains(&("minecraft:dimension_type".to_string(), 4)));
     assert!(registries.contains(&("minecraft:worldgen/biome".to_string(), 65)));
 
+    let snapshot = client.enter_play(sent_uuid).await;
+
+    assert_eq!(snapshot.login.entity_id, 0);
+    assert_eq!(snapshot.login.view_distance, 1);
+    assert_eq!(snapshot.login.simulation_distance, 1);
+    assert_eq!(snapshot.login.world_names, vec!["minecraft:overworld"]);
+    assert!(!snapshot.login.is_hardcore);
+    assert_eq!(
+        snapshot.login.world_state.dimension_name,
+        "minecraft:overworld"
+    );
+    assert_eq!(snapshot.login.world_state.gamemode, 0);
+    assert_eq!(snapshot.login.world_state.previous_gamemode, 255);
+    assert!(snapshot.login.world_state.is_flat);
+    assert!(!snapshot.login.world_state.is_debug);
+    assert_eq!(snapshot.login.world_state.hashed_seed, 0);
+    assert_eq!(snapshot.login.world_state.sea_level, 63);
+    assert_eq!(snapshot.login.world_state.portal_cooldown, 0);
+
+    // 3x3 world around (0,0): every chunk centres on the same flat template.
+    assert!(snapshot.chunks.len() == 9);
+    let (x_min, x_max) = snapshot
+        .chunks
+        .iter()
+        .map(|c| c.x)
+        .fold((i32::MAX, i32::MIN), |(lo, hi), x| (lo.min(x), hi.max(x)));
+    let (z_min, z_max) = snapshot
+        .chunks
+        .iter()
+        .map(|c| c.z)
+        .fold((i32::MAX, i32::MIN), |(lo, hi), z| (lo.min(z), hi.max(z)));
+    assert_eq!((x_min, x_max), (-1, 1));
+    assert_eq!((z_min, z_max), (-1, 1));
+    assert!(snapshot.chunks.iter().all(|c| !c.chunk_data.is_empty()));
+    let world_surface = snapshot.chunks[0].heightmaps.first().unwrap();
+    assert!(world_surface.1.len() == 37);
+    assert!(snapshot.batch.batch_size == 9);
+
+    // The platform spawn: world spawn (0, 65, 0), then player at (8.5, 65, 8.5).
+    assert_eq!(snapshot.spawn.dimension_name, "minecraft:overworld");
+    assert_eq!(snapshot.position.teleport_id, 0);
+    assert_eq!(snapshot.position.x, 8.5);
+    assert_eq!(snapshot.position.y, 65.0);
+    assert_eq!(snapshot.position.z, 8.5);
+    assert_eq!(snapshot.position.flags, 0);
+
+    // Full health, full hunger, and a chat welcome carrying the player name.
+    assert_eq!(snapshot.health.health, 20.0);
+    assert_eq!(snapshot.health.food, 20);
+    assert_eq!(snapshot.health.food_saturation, 5.0);
+    assert!(!snapshot.welcome.is_action_bar);
+    let wire = String::from_utf8_lossy(&snapshot.welcome.content);
+    assert!(wire.contains("Welcome"), "got: {wire}");
+    assert!(wire.contains("Alice"), "got: {wire}");
+
+    // The client is dropped at the end of this function, so the server can exit.
+    drop(client);
     tokio::time::timeout(Duration::from_secs(5), server)
         .await
-        .expect("server did not finish login")
+        .expect("server did not finish play")
         .unwrap();
 }
 
@@ -444,9 +617,15 @@ async fn online_login_negotiates_encryption_and_session() {
     let registries = client.complete_configuration().await;
     assert_eq!(registries.len(), 23);
 
+    let play_uuid = Uuid::parse_str(MOCK_PLAYER_ID).unwrap();
+    let snapshot = client.enter_play(play_uuid).await;
+    assert_eq!(snapshot.position.x, 8.5);
+    assert_eq!(snapshot.health.health, 20.0);
+
+    drop(client);
     tokio::time::timeout(Duration::from_secs(5), server)
         .await
-        .expect("server did not finish login")
+        .expect("server did not finish play")
         .unwrap();
     tokio::time::timeout(Duration::from_secs(5), mock_server)
         .await

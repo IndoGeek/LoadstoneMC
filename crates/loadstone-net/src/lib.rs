@@ -3,6 +3,7 @@ mod codec;
 mod connection;
 mod crypto;
 mod error;
+mod play;
 
 pub use codec::{read_frame, write_frame, FrameError};
 pub use connection::{

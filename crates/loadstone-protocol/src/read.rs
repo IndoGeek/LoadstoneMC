@@ -104,6 +104,19 @@ impl<'a> PacketReader<'a> {
         std::str::from_utf8(bytes).map_err(|_| ProtocolError::InvalidUtf8)
     }
 
+    /// Reads an optional "anonymous NBT" value from the wire: a single
+    /// `TAG_End` byte means absent, otherwise this consumes a type-byte framed
+    /// tag (root name omitted) and returns its raw bytes.
+    pub fn read_anonymous_nbt(&mut self) -> Result<Option<&'a [u8]>, ProtocolError> {
+        match anonymous_tag_end(&self.data[self.pos..])? {
+            None => {
+                self.pos += 1;
+                Ok(None)
+            }
+            Some(end) => self.take(end).map(Some),
+        }
+    }
+
     pub fn read_bytes(&mut self, len: usize) -> Result<&'a [u8], ProtocolError> {
         self.take(len)
     }
@@ -113,6 +126,129 @@ impl<'a> PacketReader<'a> {
         self.pos = self.data.len();
         rest
     }
+}
+
+/// Returns the index just past a single anonymous-NBT tag starting at `data[0]`
+/// (type byte + payload, no root name, no length prefix), or `None` when the
+/// tag is the `TAG_End` absent-value sentinel.
+fn anonymous_tag_end(data: &[u8]) -> Result<Option<usize>, ProtocolError> {
+    let ty = match data.first() {
+        Some(&0) => return Ok(None),
+        Some(&t) => t,
+        None => return Err(ProtocolError::UnexpectedEof { needed: 1, had: 0 }),
+    };
+    let mut i = 1;
+    match ty {
+        0x01 => i += 1,
+        0x02 | 0x03 | 0x05 | 0x0B => i += 4,
+        0x04 | 0x06 | 0x0C => i += 8,
+        0x07 => {
+            let n = signed_ok(data, i, 4)? as usize;
+            i += 4 + n;
+        }
+        0x08 => {
+            let n = u16::from_be_bytes([
+                *data.get(i).ok_or(short(i + 2, data.len()))?,
+                *data.get(i + 1).ok_or(short(i + 2, data.len()))?,
+            ]) as usize;
+            i += 2 + n;
+        }
+        0x09 => {
+            if data.get(i).is_none() {
+                return Err(short(i + 1, data.len()));
+            }
+            let element_ty = data[i];
+            i += 1;
+            let n = signed_ok(data, i, 4)? as usize;
+            i += 4;
+            for _ in 0..n {
+                i = value_end(data, element_ty, i)?;
+            }
+        }
+        0x0A => loop {
+            let ty = *data.get(i).ok_or(short(i + 1, data.len()))?;
+            if ty == 0 {
+                i += 1;
+                break;
+            }
+            let n = u16::from_be_bytes([
+                *data.get(i + 1).ok_or(short(i + 3, data.len()))?,
+                *data.get(i + 2).ok_or(short(i + 3, data.len()))?,
+            ]) as usize;
+            i += 3 + n;
+            i = value_end(data, ty, i)?;
+        },
+        other => {
+            return Err(ProtocolError::InvalidEnum(i32::from(other)));
+        }
+    }
+    if i > data.len() {
+        Err(short(i, data.len()))
+    } else {
+        Ok(Some(i))
+    }
+}
+
+fn signed_ok(data: &[u8], i: usize, n: usize) -> Result<i32, ProtocolError> {
+    if data.len() < i + n {
+        return Err(short(i + n, data.len()));
+    }
+    let mut bytes = [0u8; 4];
+    bytes[..n].copy_from_slice(&data[i..i + n]);
+    Ok(i32::from_be_bytes(bytes))
+}
+
+/// End of a list element or nested value: the element has no name, so skip just
+/// its payload.
+fn value_end(data: &[u8], ty: u8, start: usize) -> Result<usize, ProtocolError> {
+    match ty {
+        0x01 => Ok(start + 1),
+        0x02 => Ok(start + 2),
+        0x03 | 0x05 | 0x0B => Ok(start + 4),
+        0x04 | 0x06 | 0x0C => Ok(start + 8),
+        0x07 => {
+            let n = signed_ok(data, start, 4)? as usize;
+            Ok(start + 4 + n)
+        }
+        0x08 => {
+            let n = u16::from_be_bytes([
+                *data.get(start).ok_or(short(start + 2, data.len()))?,
+                *data.get(start + 1).ok_or(short(start + 2, data.len()))?,
+            ]) as usize;
+            Ok(start + 2 + n)
+        }
+        0x09 => {
+            let element_ty = *data.get(start).ok_or(short(start + 1, data.len()))?;
+            let n = signed_ok(data, start + 1, 4)? as usize;
+            let mut i = start + 5;
+            for _ in 0..n {
+                i = value_end(data, element_ty, i)?;
+            }
+            Ok(i)
+        }
+        0x0A => {
+            let mut i = start;
+            loop {
+                let ty = *data.get(i).ok_or(short(i + 1, data.len()))?;
+                if ty == 0 {
+                    i += 1;
+                    break;
+                }
+                let n = u16::from_be_bytes([
+                    *data.get(i + 1).ok_or(short(i + 3, data.len()))?,
+                    *data.get(i + 2).ok_or(short(i + 3, data.len()))?,
+                ]) as usize;
+                i += 3 + n;
+                i = value_end(data, ty, i)?;
+            }
+            Ok(i)
+        }
+        other => Err(ProtocolError::InvalidEnum(i32::from(other))),
+    }
+}
+
+fn short(needed: usize, had: usize) -> ProtocolError {
+    ProtocolError::UnexpectedEof { needed, had }
 }
 
 #[cfg(test)]

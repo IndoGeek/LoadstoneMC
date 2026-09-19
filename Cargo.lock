@@ -522,6 +522,7 @@ dependencies = [
  "flate2",
  "loadstone-protocol",
  "loadstone-registry",
+ "loadstone-world",
  "rand",
  "rsa",
  "serde",

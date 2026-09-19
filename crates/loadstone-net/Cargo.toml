@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 loadstone-protocol.workspace = true
 loadstone-registry.workspace = true
+loadstone-world.workspace = true
 
 tokio.workspace = true
 flate2.workspace = true
