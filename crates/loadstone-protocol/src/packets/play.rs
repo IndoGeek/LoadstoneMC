@@ -192,12 +192,12 @@ impl Packet for PlayKeepAlive {
     }
 }
 
-/// S->C Chunk Batch Start (id 0x0B). Marks the beginning of a chunk batch.
-#[derive(Debug, Clone, Copy)]
+/// S->C Chunk Batch Start (id 0x0C). Marks the beginning of a chunk batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChunkBatchStart;
 
 impl Packet for ChunkBatchStart {
-    const ID: i32 = 0x0B;
+    const ID: i32 = 0x0C;
 
     fn encode(&self, _out: &mut PacketWriter) {}
 
@@ -206,14 +206,15 @@ impl Packet for ChunkBatchStart {
     }
 }
 
-/// S->C Chunk Batch Finished (id 0x0A).
+/// S->C Chunk Batch Finished (id 0x0B). Carries the number of chunks in the
+/// batch that just ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChunkBatchFinished {
     pub batch_size: i32,
 }
 
 impl Packet for ChunkBatchFinished {
-    const ID: i32 = 0x0A;
+    const ID: i32 = 0x0B;
 
     fn encode(&self, out: &mut PacketWriter) {
         out.write_varint(self.batch_size);
@@ -223,6 +224,51 @@ impl Packet for ChunkBatchFinished {
         Ok(Self {
             batch_size: reader.read_varint()?,
         })
+    }
+}
+
+/// S->C Set Chunk Cache Center (id 0x5C). Tells the client which chunk it should
+/// treat as the centre of its loaded area, so it can drop chunks that fall
+/// outside the view distance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SetChunkCacheCenter {
+    pub chunk_x: i32,
+    pub chunk_z: i32,
+}
+
+impl Packet for SetChunkCacheCenter {
+    const ID: i32 = 0x5C;
+
+    fn encode(&self, out: &mut PacketWriter) {
+        out.write_varint(self.chunk_x).write_varint(self.chunk_z);
+    }
+
+    fn decode(reader: &mut PacketReader<'_>) -> Result<Self, ProtocolError> {
+        Ok(Self {
+            chunk_x: reader.read_varint()?,
+            chunk_z: reader.read_varint()?,
+        })
+    }
+}
+
+/// S->C Unload Chunk (id 0x25). The wire order is chunk Z before chunk X.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnloadChunk {
+    pub chunk_x: i32,
+    pub chunk_z: i32,
+}
+
+impl Packet for UnloadChunk {
+    const ID: i32 = 0x25;
+
+    fn encode(&self, out: &mut PacketWriter) {
+        out.write_i32(self.chunk_z).write_i32(self.chunk_x);
+    }
+
+    fn decode(reader: &mut PacketReader<'_>) -> Result<Self, ProtocolError> {
+        let chunk_z = reader.read_i32()?;
+        let chunk_x = reader.read_i32()?;
+        Ok(Self { chunk_x, chunk_z })
     }
 }
 
@@ -1958,6 +2004,22 @@ mod tests {
             empty_block_light_mask: vec![],
             sky_light: vec![vec![0xFF; 2048]],
             block_light: vec![],
+        });
+    }
+
+    #[test]
+    fn chunk_streaming_packets_roundtrip() {
+        assert_eq!(ChunkBatchStart::ID, 0x0C);
+        assert_eq!(ChunkBatchFinished::ID, 0x0B);
+        roundtrip(ChunkBatchStart);
+        roundtrip(ChunkBatchFinished { batch_size: 9 });
+        roundtrip(SetChunkCacheCenter {
+            chunk_x: -3,
+            chunk_z: 12,
+        });
+        roundtrip(UnloadChunk {
+            chunk_x: -3,
+            chunk_z: 12,
         });
     }
 

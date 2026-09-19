@@ -10,8 +10,10 @@ use crate::encode::{
     BLOCK_AIR, BLOCK_BEDROCK, BLOCK_DIRT, BLOCK_GRASS_BLOCK, GRASS_TOP_Y, MIN_Y, WORLD_HEIGHT,
 };
 
-/// How far the demo area extends in chunk coordinates around the spawn chunk.
-pub const LOADED_CHUNK_RADIUS: i32 = 1;
+/// How far player edits may reach from the spawn chunk. This is deliberately
+/// wider than the server's chunk view distance so walking around the streaming
+/// view never leaves the editable area.
+pub const WORLD_BORDER_RADIUS: i32 = 8;
 /// The top of the world, exclusive (build height).
 pub const WORLD_TOP_Y: i32 = MIN_Y + WORLD_HEIGHT;
 
@@ -28,11 +30,11 @@ pub fn flat_block(x: i32, y: i32, z: i32) -> u16 {
     }
 }
 
-/// Whether the player may interact with a coordinate: inside the loaded area,
-/// above the unbreakable bedrock floor and below the build height.
+/// Whether the player may interact with a coordinate: inside the demo world
+/// border, above the unbreakable bedrock floor and below the build height.
 pub fn allow_editing(x: i32, y: i32, z: i32) -> bool {
-    let within_x = (-LOADED_CHUNK_RADIUS..=LOADED_CHUNK_RADIUS).contains(&x.div_euclid(16));
-    let within_z = (-LOADED_CHUNK_RADIUS..=LOADED_CHUNK_RADIUS).contains(&z.div_euclid(16));
+    let within_x = (-WORLD_BORDER_RADIUS..=WORLD_BORDER_RADIUS).contains(&x.div_euclid(16));
+    let within_z = (-WORLD_BORDER_RADIUS..=WORLD_BORDER_RADIUS).contains(&z.div_euclid(16));
     within_x && within_z && y > MIN_Y && y < WORLD_TOP_Y
 }
 
@@ -111,7 +113,7 @@ mod tests {
         assert!(world.is_breakable(8, 0, 8)); // dirt
         assert!(!world.is_breakable(8, -64, 8)); // bedrock
         assert!(!world.is_breakable(8, 65, 8)); // air
-        assert!(!world.is_breakable(100, 64, 100)); // outside the loaded area
+        assert!(!world.is_breakable(1000, 64, 1000)); // outside the world border
         assert!(!world.is_breakable(8, 319, 8)); // above the build height
 
         assert!(world.is_empty(8, 65, 8));

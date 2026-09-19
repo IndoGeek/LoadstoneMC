@@ -25,8 +25,9 @@ use loadstone_protocol::packets::play::{
     pack_position, Abilities, BlockChange, BlockDig, BlockPlace, BundleDelimiter,
     ChunkBatchFinished, ChunkBatchReceived, ChunkBatchStart, ClientPosition, EntityMetadata,
     Experience, MapChunk, PlayKeepAlive, PlayKeepAliveResponse, PlayLogin, PlayerInfoUpdate,
-    PlayerPosition, PlayerRemove, RemoveEntities, ServerData, SpawnEntity, SpawnPosition,
-    SyncEntityPosition, SystemChat, TeleportConfirm, UpdateHealth, UpdateTime, ENTITY_TYPE_PLAYER,
+    PlayerPosition, PlayerRemove, RemoveEntities, ServerData, SetChunkCacheCenter, SpawnEntity,
+    SpawnPosition, SyncEntityPosition, SystemChat, TeleportConfirm, UnloadChunk, UpdateHealth,
+    UpdateTime, ENTITY_TYPE_PLAYER,
 };
 use loadstone_protocol::packets::Handshake;
 use loadstone_protocol::write_varint;
@@ -339,6 +340,7 @@ impl Client {
                     spawn = Some(SpawnPosition::decode(&mut PacketReader::new(&body)).unwrap());
                 }
                 id if id == ChunkBatchStart::ID => {}
+                id if id == SetChunkCacheCenter::ID => {}
                 id if id == MapChunk::ID => {
                     chunks.push(MapChunk::decode(&mut PacketReader::new(&body)).unwrap());
                 }
@@ -828,6 +830,52 @@ async fn two_players_share_the_world() {
     assert!(gone.entity_ids.contains(&bob_entity));
 
     drop(alice);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn chunks_stream_across_chunk_borders() {
+    let (addr, server) = spawn_server(base_config(false)).await;
+    let (mut client, _uuid, snapshot) = offline_join(&addr, "Alice").await;
+    assert_eq!(snapshot.chunks.len(), 9);
+
+    // Step one chunk east: chunk (0, 0) -> chunk (1, 0).
+    client.send_position(24.5, 65.0, 8.5).await;
+
+    // The server moves the client's view centre first.
+    let (id, body) = client.next_event().await;
+    assert_eq!(id, SetChunkCacheCenter::ID);
+    let center = SetChunkCacheCenter::decode(&mut PacketReader::new(&body)).unwrap();
+    assert_eq!((center.chunk_x, center.chunk_z), (1, 0));
+
+    // Then the three columns (x = 2) that just entered view are batched.
+    let (id, _) = client.next_event().await;
+    assert_eq!(id, ChunkBatchStart::ID);
+    let mut loaded = Vec::new();
+    let batch_size = loop {
+        let (id, body) = client.next_event().await;
+        if id == MapChunk::ID {
+            loaded.push(MapChunk::decode(&mut PacketReader::new(&body)).unwrap());
+        } else {
+            assert_eq!(id, ChunkBatchFinished::ID);
+            break ChunkBatchFinished::decode(&mut PacketReader::new(&body))
+                .unwrap()
+                .batch_size;
+        }
+    };
+    assert_eq!(batch_size, 3);
+    assert_eq!(loaded.len(), 3);
+    assert!(loaded.iter().all(|chunk| chunk.x == 2));
+
+    // And the three columns (x = -1) that fell out of view are unloaded.
+    for _ in 0..3 {
+        let (id, body) = client.next_event().await;
+        assert_eq!(id, UnloadChunk::ID);
+        let unloaded = UnloadChunk::decode(&mut PacketReader::new(&body)).unwrap();
+        assert_eq!(unloaded.chunk_x, -1);
+    }
+
+    drop(client);
     server.abort();
 }
 

@@ -13,8 +13,9 @@ small, fast, low-overhead core in the spirit of Pumpkin and Steel.
 | Login, offline mode | works |
 | Login, online mode (RSA key exchange, AES-128/CFB8, Mojang `hasJoined`, compression) | works |
 | Configuration state (known packs, feature flags, registry data, tags, finish) | works |
-| Play state (login, world spawn, 3x3 chunk batch, position, keep-alive, chat echo, block dig/place) | works |
+| Play state (login, world spawn, position, keep-alive, chat echo, block dig/place) | works |
 | Multiple players in one shared world (tab list, spawn/despawn, movement sync, shared block edits) | works |
+| Chunk streaming as players cross chunk borders (batched loads, unloads, view centre) | works |
 | Non-player entities, mob AI, worldgen, persistence | not implemented |
 
 A vanilla client can ping the server, complete login, and finish the whole
@@ -25,14 +26,17 @@ world spawn and chunk batch (with heightmaps and full-bright sky light),
 acknowledges the chunk batch, teleports the player to spawn, enters the tab
 list, and runs keep-alive, ping/pong, teleport confirmations and chat echo
 (including the Mojang-signed session key chain on online mode) until the client
-disconnects. The world is mutable: digging a block or placing another is
-validated against a shared in-memory model of the flat world (bedrock is
-unbreakable, out-of-bounds edits are ignored) and the resulting block change is
-broadcast to every player. All connections share that world and a player
-registry: joining players are shown the players already present (tab-list entry,
-`spawn_entity` and skin-layer metadata, wrapped in a bundle), and movement,
-chat and block edits are pushed to the other players' connections. Leaving
-players are announced with `player_remove` + `remove_entities`.
+disconnects. Walking into a neighbouring chunk moves the client's view centre
+(`set_chunk_cache_center`), streams the columns that entered view as a chunk
+batch and sends `unload_chunk` for the ones that left it. The world is mutable:
+digging a block or placing another is validated against a shared in-memory model
+of the flat world (bedrock is unbreakable, out-of-bounds edits are ignored) and
+the resulting block change is broadcast to every player. All connections share
+that world and a player registry: joining players are shown the players already
+present (tab-list entry, `spawn_entity` and skin-layer metadata, wrapped in a
+bundle), and movement, chat and block edits are pushed to the other players'
+connections. Leaving players are announced with `player_remove` +
+`remove_entities`.
 
 ## Build and run
 
@@ -95,10 +99,12 @@ client acknowledges, and then spawns a simulated player: it checks the Play logi
 packet's dimension/spawn info, the 3x3 chunk batch (ultra-precise heightmaps,
 non-empty chunk data), the spawn position, the teleport to (8.5, 65.0, 8.5),
 full health/hunger, the tab list entry, and the welcome chat line carrying the
-player's name. A second test runs two clients against one server and checks that
-each sees the other spawn (`spawn_entity`, type 117), that movement arrives as an
-entity sync, that a block edit by one is broadcast to the other, and that a
-disconnect produces `player_remove` + `remove_entities`.
+player's name. Another test walks one chunk east and checks that the view centre
+moves, the three newly visible columns are streamed as a batch, and the three
+that fell out of view are unloaded. A third test runs two clients against one
+server and checks that each sees the other spawn (`spawn_entity`, type 117), that
+movement arrives as an entity sync, that a block edit by one is broadcast to the
+other, and that a disconnect produces `player_remove` + `remove_entities`.
 
 `tools/live_login_check.py` does the same over a socket against a real running
 binary, with a client written independently of the server (Python `cryptography`):
@@ -109,9 +115,10 @@ python3 tools/live_login_check.py --mode online   # spawns it with --online-mode
 python3 tools/live_login_check.py --no-spawn --port 25565
 ```
 
-It covers the server list ping, an offline login, an online login (key exchange
-→ AES/CFB8 → `hasJoined` → compression → Login Success → acknowledgement → the
-full Configuration handshake → the Play state), a two-client shared-world check
+It covers the server list ping, an offline login, chunk streaming as the player
+walks across a chunk border, an online login (key exchange → AES/CFB8 →
+`hasJoined` → compression → Login Success → acknowledgement → the full
+Configuration handshake → the Play state), a two-client shared-world check
 (presence, movement, shared block edit, disconnect) and both online-mode
 refusals: an unverified account, and a key exchange that does not echo the
 verify token. Exit status is non-zero if anything fails, so it can gate a
@@ -127,6 +134,9 @@ release.
 - Protocol 774 has no dedicated player-spawn packet: other players are
   `spawn_entity` with entity type 117 (`minecraft:player`), sent inside a bundle
   delimiter pair together with their tab-list entry and entity metadata.
+- Chunk batches use `chunk_batch_start` id `0x0C` and `chunk_batch_finished` id
+  `0x0B` (the latter carries a VarInt batch size, not a float). Note the finish
+  id is lower than the start id, and `unload_chunk` sends chunk Z before chunk X.
 - Encryption is RSA-1024 with PKCS#1 v1.5 for the key exchange, then
   AES-128/CFB8 over the whole stream with the shared secret as both key and IV,
   exactly as Java's `AES/CFB8/NoPadding` does.
@@ -153,10 +163,9 @@ release.
 ## Roadmap
 
 1. **Game feel** — non-player entities, mob AI, custom world generation and
-   persistence. The flat 3x3 demo world gets replaced with real chunks. Block
-   edits, movement and player presence already share one world across every
-   connection; the next step is streaming chunks to players as they move and
-   saving the world to disk.
+   persistence. The flat demo world is streamed as players cross chunk borders;
+   the next step is real terrain generation (replacing the uniform flat chunk)
+   and saving edits to disk.
 2. **Custom registries** — the current data is the vanilla set with NBT omitted;
    serving custom biomes/dimensions means emitting entry NBT as well.
 3. **Player data & chat** — verify the Mojang-signed session key chain for chat

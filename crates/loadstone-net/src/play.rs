@@ -2,6 +2,7 @@
 //! in-game loop. Every connection shares one [`World`] and one player registry,
 //! so joins, movements, block edits and disconnects are broadcast to everyone.
 
+use std::collections::HashSet;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use loadstone_protocol::packets::play::{
@@ -10,8 +11,9 @@ use loadstone_protocol::packets::play::{
     ChunkBlockEntity, ClientPosition, EntityHeadRotation, EntityLook, EntityMetadata, Experience,
     MapChunk, MovementFlags, PingRequest, PlayKeepAlive, PlayKeepAliveResponse, PlayLogin,
     PlayPong, PlayPongResponse, PlayerInfoEntry, PlayerInfoUpdate, PlayerLook, PlayerPosition,
-    PlayerPositionLook, PlayerRemove, RemoveEntities, SpawnEntity, SpawnInfo, SpawnPosition,
-    SyncEntityPosition, SystemChat, TeleportConfirm, UpdateHealth, UpdateTime,
+    PlayerPositionLook, PlayerRemove, RemoveEntities, SetChunkCacheCenter, SpawnEntity, SpawnInfo,
+    SpawnPosition, SyncEntityPosition, SystemChat, TeleportConfirm, UnloadChunk, UpdateHealth,
+    UpdateTime,
 };
 use loadstone_protocol::Nbt;
 use loadstone_protocol::{Packet, PacketReader, PacketWriter};
@@ -23,7 +25,8 @@ use uuid::Uuid;
 use crate::connection::{Connection, ConnectionConfig};
 use crate::error::NetError;
 
-/// The initial chunk-view radius (view distance 1 sends a 3x3 area).
+/// The chunk-view radius (view distance 1 sends a 3x3 area). Chunks are
+/// streamed to each player as they cross chunk boundaries.
 const VIEW_DISTANCE: i32 = 1;
 const SIMULATION_DISTANCE: i32 = 1;
 /// Uniform keep-alive interval while the player is in the game.
@@ -56,6 +59,31 @@ fn encode_body<P: Packet>(packet: &P) -> Vec<u8> {
 
 fn text(message: &str) -> Vec<u8> {
     Nbt::text(message).to_anonymous_bytes()
+}
+
+/// The chunk a block coordinate falls in, using floor division so negative
+/// coordinates round toward negative infinity.
+fn chunk_of(x: f64, z: f64) -> (i32, i32) {
+    (x.div_euclid(16.0) as i32, z.div_euclid(16.0) as i32)
+}
+
+/// Every chunk coordinate within `radius` of `(center_x, center_z)`.
+fn visible_chunks(center_x: i32, center_z: i32, radius: i32) -> Vec<(i32, i32)> {
+    let mut chunks = Vec::with_capacity(((radius * 2 + 1) * (radius * 2 + 1)) as usize);
+    for dz in -radius..=radius {
+        for dx in -radius..=radius {
+            chunks.push((center_x + dx, center_z + dz));
+        }
+    }
+    chunks
+}
+
+/// Encodes the shared flat chunk at `(x, z)` by retagging the prebuilt template.
+fn encode_map_chunk(template: &MapChunk, x: i32, z: i32) -> Vec<u8> {
+    let mut chunk = template.clone();
+    chunk.x = x;
+    chunk.z = z;
+    encode_body(&chunk)
 }
 
 /// A snapshot of a player who was already in the world when a newcomer joined.
@@ -144,12 +172,29 @@ async fn run_play(
     })?;
     let biome_id = biome_id as u32;
 
+    // Every chunk in the flat demo world is identical, so build one template
+    // and only retag its coordinates when streaming individual chunks.
     let world_origin = encode::flat_chunk(0, 0);
     let heights = encode::column_heights(&world_origin);
     let heightmap_data = encode::pack_heightmap(&heights, encode::WORLD_HEIGHT);
     let chunk_data = encode::encode_chunk_column(&world_origin, biome_id);
-    let sky_light = encode::full_sky_light(24);
-    let sky_light_mask = vec![((1 << 24) - 1) as i64];
+    let chunk_template = MapChunk {
+        x: 0,
+        z: 0,
+        heightmaps: vec![
+            (HEIGHTMAP_WORLD_SURFACE, heightmap_data.clone()),
+            (HEIGHTMAP_MOTION_BLOCKING, heightmap_data.clone()),
+            (HEIGHTMAP_MOTION_BLOCKING_NO_LEAVES, heightmap_data.clone()),
+        ],
+        chunk_data,
+        block_entities: vec![] as Vec<ChunkBlockEntity>,
+        sky_light_mask: vec![((1 << 24) - 1) as i64],
+        block_light_mask: Vec::new(),
+        empty_sky_light_mask: Vec::new(),
+        empty_block_light_mask: Vec::new(),
+        sky_light: encode::full_sky_light(24),
+        block_light: Vec::new(),
+    };
 
     // 1. Login: dimension, spawn info and world rendering settings.
     let login = PlayLogin {
@@ -192,30 +237,20 @@ async fn run_play(
     let body = encode_body(&spawn_pos);
     conn.write_packet(SpawnPosition::ID, &body).await?;
 
+    let spawn_center = chunk_of(encode::SPAWN_X, encode::SPAWN_Z);
+    let initial = visible_chunks(spawn_center.0, spawn_center.1, VIEW_DISTANCE);
+
+    let body = encode_body(&SetChunkCacheCenter {
+        chunk_x: spawn_center.0,
+        chunk_z: spawn_center.1,
+    });
+    conn.write_packet(SetChunkCacheCenter::ID, &body).await?;
+
     let body = encode_body(&ChunkBatchStart);
     conn.write_packet(ChunkBatchStart::ID, &body).await?;
-    for cx in -1..=1 {
-        for cz in -1..=1 {
-            let mp = MapChunk {
-                x: cx,
-                z: cz,
-                heightmaps: vec![
-                    (HEIGHTMAP_WORLD_SURFACE, heightmap_data.clone()),
-                    (HEIGHTMAP_MOTION_BLOCKING, heightmap_data.clone()),
-                    (HEIGHTMAP_MOTION_BLOCKING_NO_LEAVES, heightmap_data.clone()),
-                ],
-                chunk_data: chunk_data.clone(),
-                block_entities: vec![] as Vec<ChunkBlockEntity>,
-                sky_light_mask: sky_light_mask.clone(),
-                block_light_mask: Vec::new(),
-                empty_sky_light_mask: Vec::new(),
-                empty_block_light_mask: Vec::new(),
-                sky_light: sky_light.clone(),
-                block_light: Vec::new(),
-            };
-            let body = encode_body(&mp);
-            conn.write_packet(MapChunk::ID, &body).await?;
-        }
+    for &(cx, cz) in &initial {
+        let body = encode_map_chunk(&chunk_template, cx, cz);
+        conn.write_packet(MapChunk::ID, &body).await?;
     }
     // The client acknowledges the batch; the finished packet lifts the tunnel.
     loop {
@@ -225,8 +260,11 @@ async fn run_play(
             break;
         }
     }
-    let body = encode_body(&ChunkBatchFinished { batch_size: 9 });
+    let body = encode_body(&ChunkBatchFinished {
+        batch_size: initial.len() as i32,
+    });
     conn.write_packet(ChunkBatchFinished::ID, &body).await?;
+    let loaded_chunks: HashSet<(i32, i32)> = initial.into_iter().collect();
 
     // 3. Place the player at the spawn point and introduce them in the tab list.
     let teleport = ClientPosition::absolute(
@@ -301,7 +339,16 @@ async fn run_play(
     conn.write_packet(SystemChat::ID, &body).await?;
 
     info!(name = %username, entity_id, "player entered the world");
-    play_loop(&mut conn, uuid, username, config, rx).await
+    play_loop(
+        &mut conn,
+        uuid,
+        username,
+        config,
+        chunk_template,
+        loaded_chunks,
+        rx,
+    )
+    .await
 }
 
 /// A tab-list "add player" entry with the fields we always populate.
@@ -451,17 +498,20 @@ fn record_movement(
 }
 
 /// The in-game packet loop. Reads from the client, replies to keep-alives and
-/// pings, applies movement/block edits to the shared world, and flushes packets
-/// pushed by other connections.
+/// pings, applies movement/block edits to the shared world, streams chunks when
+/// the player crosses a chunk border, and flushes packets pushed by others.
 async fn play_loop(
     conn: &mut Connection,
     uuid: Uuid,
     username: &str,
     config: &ConnectionConfig,
+    chunk_template: MapChunk,
+    mut loaded_chunks: HashSet<(i32, i32)>,
     mut rx: mpsc::UnboundedReceiver<(i32, Vec<u8>)>,
 ) -> Result<(), NetError> {
     let mut keep_alive_id: i64 = 1;
     let mut deadline = tokio::time::Instant::now() + KEEP_ALIVE_PERIOD;
+    let mut center = chunk_of(encode::SPAWN_X, encode::SPAWN_Z);
 
     loop {
         tokio::select! {
@@ -479,7 +529,19 @@ async fn play_loop(
             }
             frame = conn.read_packet() => {
                 let frame = frame?;
-                handle_frame(conn, uuid, username, config, frame).await?;
+                if let Some((x, z)) = handle_frame(conn, uuid, username, config, frame).await? {
+                    let new_center = chunk_of(x, z);
+                    if new_center != center {
+                        stream_chunks(
+                            conn,
+                            &chunk_template,
+                            &mut loaded_chunks,
+                            new_center,
+                        )
+                        .await?;
+                        center = new_center;
+                    }
+                }
             }
         }
     }
@@ -487,13 +549,66 @@ async fn play_loop(
     Ok(())
 }
 
+/// Sends a chunk batch for the columns that entered view and unload packets for
+/// the columns that left it, then records the new view. The view position is
+/// announced first so the client knows the new centre.
+async fn stream_chunks(
+    conn: &mut Connection,
+    template: &MapChunk,
+    loaded: &mut HashSet<(i32, i32)>,
+    center: (i32, i32),
+) -> Result<(), NetError> {
+    let body = encode_body(&SetChunkCacheCenter {
+        chunk_x: center.0,
+        chunk_z: center.1,
+    });
+    conn.write_packet(SetChunkCacheCenter::ID, &body).await?;
+
+    let view = visible_chunks(center.0, center.1, VIEW_DISTANCE);
+    let to_load: Vec<(i32, i32)> = view
+        .iter()
+        .copied()
+        .filter(|chunk| !loaded.contains(chunk))
+        .collect();
+
+    if !to_load.is_empty() {
+        let body = encode_body(&ChunkBatchStart);
+        conn.write_packet(ChunkBatchStart::ID, &body).await?;
+        for &(cx, cz) in &to_load {
+            let body = encode_map_chunk(template, cx, cz);
+            conn.write_packet(MapChunk::ID, &body).await?;
+        }
+        let body = encode_body(&ChunkBatchFinished {
+            batch_size: to_load.len() as i32,
+        });
+        conn.write_packet(ChunkBatchFinished::ID, &body).await?;
+    }
+
+    let view_set: HashSet<(i32, i32)> = view.into_iter().collect();
+    for (cx, cz) in loaded.iter() {
+        if !view_set.contains(&(*cx, *cz)) {
+            let body = encode_body(&UnloadChunk {
+                chunk_x: *cx,
+                chunk_z: *cz,
+            });
+            conn.write_packet(UnloadChunk::ID, &body).await?;
+        }
+    }
+
+    *loaded = view_set;
+    Ok(())
+}
+
+/// Handles one clientbound frame. Returns the player's `(x, z)` when the frame
+/// carried a position update, so the caller can re-stream chunks if needed.
 async fn handle_frame(
     conn: &mut Connection,
     uuid: Uuid,
     username: &str,
     config: &ConnectionConfig,
     frame: crate::connection::RawPacket,
-) -> Result<(), NetError> {
+) -> Result<Option<(f64, f64)>, NetError> {
+    let mut moved = None;
     match frame.id {
         id if id == PlayKeepAliveResponse::ID => {
             let _ = PlayKeepAliveResponse::decode(&mut PacketReader::new(&frame.body))?;
@@ -525,6 +640,7 @@ async fn handle_frame(
         id if id == PlayerPosition::ID => {
             let movement = PlayerPosition::decode(&mut PacketReader::new(&frame.body))?;
             let on_ground = movement.flags & MovementFlags::ON_GROUND != 0;
+            moved = Some((movement.x, movement.z));
             sync_entity_position(
                 config,
                 uuid,
@@ -536,6 +652,7 @@ async fn handle_frame(
         id if id == PlayerPositionLook::ID => {
             let movement = PlayerPositionLook::decode(&mut PacketReader::new(&frame.body))?;
             let on_ground = movement.flags & MovementFlags::ON_GROUND != 0;
+            moved = Some((movement.x, movement.z));
             sync_entity_position(
                 config,
                 uuid,
@@ -616,7 +733,7 @@ async fn handle_frame(
         }
     }
 
-    Ok(())
+    Ok(moved)
 }
 
 /// Updates the registry with a movement and broadcasts the resulting absolute

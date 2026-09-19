@@ -75,10 +75,11 @@ PKT_CONFIG_ACK = 0x03
 PKT_PLAY_BUNDLE_DELIMITER = 0x00
 PKT_PLAY_SPAWN_ENTITY = 0x01
 PKT_PLAY_BLOCK_CHANGE = 0x08
-PKT_PLAY_CHUNK_BATCH_FINISHED = 0x0A
-PKT_PLAY_CHUNK_BATCH_START = 0x0B
+PKT_PLAY_CHUNK_BATCH_FINISHED = 0x0B
+PKT_PLAY_CHUNK_BATCH_START = 0x0C
 PKT_PLAY_DISCONNECT = 0x20
 PKT_PLAY_SYNC_ENTITY_POSITION = 0x23
+PKT_PLAY_UNLOAD_CHUNK = 0x25
 PKT_PLAY_KEEP_ALIVE = 0x2B
 PKT_PLAY_MAP_CHUNK = 0x2C
 PKT_PLAY_LOGIN = 0x30
@@ -88,6 +89,7 @@ PKT_PLAY_PLAYER_INFO = 0x44
 PKT_PLAY_POSITION = 0x46
 PKT_PLAY_ENTITY_HEAD_ROTATION = 0x51
 PKT_PLAY_SERVER_DATA = 0x54
+PKT_PLAY_SET_CHUNK_CACHE_CENTER = 0x5C
 PKT_PLAY_SPAWN_POSITION = 0x5F
 PKT_PLAY_ENTITY_METADATA = 0x61
 PKT_PLAY_EXPERIENCE = 0x65
@@ -573,6 +575,64 @@ def check_two_players(host: str, port: int) -> None:
         bob.close()
 
 
+def check_chunk_streaming(host: str, port: int) -> None:
+    """Walking into a neighbouring chunk streams the columns that entered view
+    and unloads the ones that fell out of it."""
+    client = Client(host, port)
+    try:
+        handshake(client, host, port, 2)
+        login_start(client, "Walker")
+        read_set_compression(client)
+        read_login_success(client)
+        client.write_packet(PKT_LOGIN_ACKNOWLEDGED)
+        complete_configuration(client)
+        drive_into_play(client, "Walker", expected_entity_id=None)
+
+        # Walk east, from chunk (0,0) into chunk (1,0).
+        client.write_packet(PKT_PLAY_POSITION_SB, struct.pack(">3d", 24.5, 65.0, 8.5) + b"\x01")
+
+        packet_id, body = next_play_packet(client)
+        if not check(packet_id == PKT_PLAY_SET_CHUNK_CACHE_CENTER,
+                     "crossing a chunk border announces the new centre",
+                     f"id {packet_id:#04x}"):
+            return
+        center_x, size = read_varint(body)
+        center_z, _ = read_varint(body, size)
+        check((center_x, center_z) == (1, 0), "the view centre follows the player",
+              f"({center_x}, {center_z})")
+
+        packet_id, _ = next_play_packet(client)
+        check(packet_id == PKT_PLAY_CHUNK_BATCH_START, "new chunks arrive as a batch",
+              f"id {packet_id:#04x}")
+
+        loaded = []
+        batch_size = None
+        while True:
+            packet_id, body = next_play_packet(client)
+            if packet_id == PKT_PLAY_MAP_CHUNK:
+                loaded.append(struct.unpack(">i", body[:4])[0])
+            elif packet_id == PKT_PLAY_CHUNK_BATCH_FINISHED:
+                batch_size, _ = read_varint(body)
+                break
+        check(batch_size == 3 and loaded == [2, 2, 2],
+              "the three columns that entered view are streamed",
+              f"size {batch_size} xs {loaded}")
+
+        unloaded = []
+        for _ in range(3):
+            packet_id, body = next_play_packet(client)
+            if not check(packet_id == PKT_PLAY_UNLOAD_CHUNK,
+                         "columns that left view are unloaded", f"id {packet_id:#04x}"):
+                return
+            chunk_z = struct.unpack(">i", body[:4])[0]
+            chunk_x = struct.unpack(">i", body[4:8])[0]
+            unloaded.append((chunk_x, chunk_z))
+        check(sorted(unloaded) == [(-1, -1), (-1, 0), (-1, 1)],
+              "the whole column band that left view is unloaded", str(unloaded))
+    finally:
+        client.close()
+
+
 def check_status(host: str, port: int, motd: str) -> None:
     client = Client(host, port)
     try:
@@ -898,6 +958,7 @@ def main() -> int:
 
         if args.mode == "offline":
             check_offline_login(args.host, args.port, args.name)
+            check_chunk_streaming(args.host, args.port)
             check_two_players(args.host, args.port)
         elif session is not None:
             check_online_login(args.host, args.port, args.mock_name, session)
