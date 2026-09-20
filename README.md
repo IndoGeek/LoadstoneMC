@@ -102,16 +102,21 @@ installed (`rustup target add x86_64-unknown-linux-musl`).
 ### Pterodactyl
 
 `pterodactyl/egg-loadstone.json` is a ready-to-import egg. The installer detects
-the machine architecture, downloads the matching release binary and makes it
-executable; the runtime uses the Debian yolks image and needs no Java. The egg
-exposes the MOTD, max players, online mode, save interval and extra arguments as
-variables, binds the server to the allocated `SERVER_PORT`, and stops it
-gracefully by sending `stop` on stdin. Import it from **Nests → Import Egg**.
+the machine architecture, downloads the matching static release binary and makes
+it executable; the runtime uses the Debian yolks image and needs no Java. The
+egg exposes the MOTD, max players, online mode, save interval and extra
+arguments as variables, binds the server to the allocated `SERVER_PORT`, and
+stops it gracefully by sending `stop` on stdin. Import it from
+**Nests → Import Egg**.
+
+Because the Pterodactyl entrypoint word-splits the startup command, the MOTD is
+not passed as an argument: the server reads the `MOTD` environment variable
+instead, so a description containing spaces works fine.
 
 | Flag | Default | Meaning |
 |---|---|---|
 | `--bind` | `0.0.0.0:25565` | Address to listen on |
-| `--motd` | `A LoadstoneMC server` | Server list description |
+| `--motd` | `MOTD` env, else `A LoadstoneMC server` | Server list description |
 | `--max-players` | `20` | Players shown in the server list |
 | `--online-mode` | off | Require encryption + Mojang session verification |
 | `--sessionserver-url` | Mojang's `hasJoined` | Base URL for session verification |

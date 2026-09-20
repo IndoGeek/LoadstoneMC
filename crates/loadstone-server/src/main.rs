@@ -16,9 +16,10 @@ struct Args {
     #[arg(long, default_value = "0.0.0.0:25565")]
     bind: String,
 
-    /// Server list MOTD.
-    #[arg(long, default_value = "A LoadstoneMC server")]
-    motd: String,
+    /// Server list MOTD. Defaults to the `MOTD` environment variable (the
+    /// convention Pterodactyl uses) or "A LoadstoneMC server".
+    #[arg(long)]
+    motd: Option<String>,
 
     /// Maximum number of players shown in the server list.
     #[arg(long, default_value_t = 20)]
@@ -65,6 +66,10 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let args = Args::parse();
+    let motd = args
+        .motd
+        .clone()
+        .unwrap_or_else(|| std::env::var("MOTD").unwrap_or_else(|_| "A LoadstoneMC server".into()));
     let world_dir = args.world.clone();
 
     let seed = match args.seed {
@@ -87,7 +92,7 @@ async fn main() -> anyhow::Result<()> {
     info!(mobs = entities.len(), "spawned mobs");
 
     let net_config = ConnectionConfig {
-        motd: args.motd,
+        motd,
         max_players: args.max_players,
         online_players: 0,
         online_mode: args.online_mode,
@@ -105,6 +110,7 @@ async fn main() -> anyhow::Result<()> {
         version = MINECRAFT_VERSION,
         protocol = PROTOCOL_VERSION,
         online_mode = args.online_mode,
+        motd = %net_config.motd,
         "loadstone server listening on {}",
         args.bind
     );

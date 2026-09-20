@@ -13,7 +13,7 @@
         "Debian": "ghcr.io/pterodactyl/yolks:debian"
     },
     "file_denylist": [],
-    "startup": "./loadstone --bind 0.0.0.0:{{SERVER_PORT}} --motd \"{{MOTD}}\" --max-players {{MAX_PLAYERS}} --online-mode={{ONLINE_MODE}} --save-interval {{SAVE_INTERVAL}} {{EXTRA_ARGS}}",
+    "startup": "./loadstone --bind 0.0.0.0:{{SERVER_PORT}} --max-players {{MAX_PLAYERS}} --online-mode={{ONLINE_MODE}} --save-interval {{SAVE_INTERVAL}} {{EXTRA_ARGS}}",
     "config": {
         "files": "{}",
         "startup": "{\"done\": \"loadstone server listening on\"}",
@@ -30,7 +30,7 @@
     "variables": [
         {
             "name": "MOTD",
-            "description": "Server list message of the day.",
+            "description": "Server list message of the day. The server reads this from the environment, so it can contain spaces.",
             "env_variable": "MOTD",
             "default_value": "A LoadstoneMC server",
             "user_viewable": true,
