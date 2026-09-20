@@ -17,9 +17,11 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
+            target: x86_64-unknown-linux-musl
+            musl: true
           - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
+            target: aarch64-unknown-linux-musl
+            musl: true
           - os: macos-15-intel
             target: x86_64-apple-darwin
           - os: macos-15
@@ -30,6 +32,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install musl toolchain
+        if: matrix.musl
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -39,7 +47,16 @@ jobs:
           key: ${{ matrix.target }}
 
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }} --bin loadstone
+        shell: bash
+        run: |
+          target='${{ matrix.target }}'
+          # Build a fully static binary on Linux so it runs on any distro,
+          # including the older Debian base of the Pterodactyl yolks image.
+          if [[ "$target" == *linux-musl ]]; then
+            export "CC_$(echo "$target" | tr - _)=musl-gcc"
+            export "CARGO_TARGET_$(echo "$target" | tr 'a-z-' 'A-Z_')_LINKER=musl-gcc"
+          fi
+          cargo build --release --target "$target" --bin loadstone
 
       - name: Package
         shell: bash

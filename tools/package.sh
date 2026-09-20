@@ -19,6 +19,15 @@ cd "$root"
 target="${1:-}"
 if [[ -z "$target" ]]; then
     target="$(rustc -vV | sed -n 's/^host: //p')"
+    # Prefer a static musl build on Linux so the archive runs on any distro,
+    # including the older Debian base used by the Pterodactyl yolks image.
+    if [[ "$target" == *-linux-gnu ]]; then
+        musl="${target%-gnu}-musl"
+        if rustup target list --installed 2>/dev/null | grep -qx "$musl"; then
+            target="$musl"
+            echo "package: defaulting to static target $target"
+        fi
+    fi
 fi
 
 if [[ "${SKIP_BUILD:-0}" != "1" ]]; then

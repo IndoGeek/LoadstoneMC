@@ -84,18 +84,20 @@ binary if the only cargo it can find is too old (this project needs 1.80+).
 ### Prebuilt binaries
 
 Release archives are published on GitHub for Linux (x86-64, arm64), macOS
-(x86-64, arm64) and Windows (x86-64). Each archive contains the self-contained
-`loadstone` server binary (no Java needed), the README, the LICENSE and the
-Pterodactyl egg:
+(x86-64, arm64) and Windows (x86-64). The Linux builds are statically linked
+against musl, so the binary has no glibc requirement and runs on any
+distribution. Each archive contains the self-contained `loadstone` server
+binary (no Java needed), the README, the LICENSE and the Pterodactyl egg:
 
 ```bash
-tar -xzf loadstone-x86_64-unknown-linux-gnu.tar.gz
-cd loadstone-x86_64-unknown-linux-gnu
+tar -xzf loadstone-x86_64-unknown-linux-musl.tar.gz
+cd loadstone-x86_64-unknown-linux-musl
 ./loadstone --bind 0.0.0.0:25565
 ```
 
 `tools/package.sh [target-triple]` builds the same archive locally and writes it
-to `dist/`.
+to `dist/`; on Linux it defaults to the static musl target when that target is
+installed (`rustup target add x86_64-unknown-linux-musl`).
 
 ### Pterodactyl
 
