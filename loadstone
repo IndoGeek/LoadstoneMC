@@ -9,22 +9,56 @@
 #   ./loadstone --bind 0.0.0.0:25565 --motd "My server"
 #   ./loadstone --online-mode --world world
 #
-# If cargo is available the release binary is rebuilt (incrementally) before it
-# is run. Set LOADSTONE_BIN to run a prebuilt binary instead, or
+# If a suitable cargo is available the release binary is rebuilt (incrementally)
+# before it is run. Set LOADSTONE_BIN to run a prebuilt binary instead, or
 # LOADSTONE_NO_BUILD=1 to run the existing build without invoking cargo.
 set -euo pipefail
 
 root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+existing="$root/target/release/loadstone"
+
+find_cargo() {
+    if [[ -n "${CARGO:-}" ]]; then
+        printf '%s\n' "$CARGO"
+    # The rustup shim is usually newer than a distro cargo and is safe to prefer.
+    elif [[ -x "${HOME:-}/.cargo/bin/cargo" ]]; then
+        printf '%s\n' "$HOME/.cargo/bin/cargo"
+    elif command -v cargo >/dev/null 2>&1; then
+        command -v cargo
+    fi
+}
 
 if [[ -n "${LOADSTONE_BIN:-}" ]]; then
     bin="$LOADSTONE_BIN"
-elif [[ "${LOADSTONE_NO_BUILD:-0}" != "1" ]] && command -v cargo >/dev/null 2>&1 && [[ -f "$root/Cargo.toml" ]]; then
-    cargo build --release --quiet --manifest-path "$root/Cargo.toml" --bin loadstone
-    bin="$root/target/release/loadstone"
-elif [[ -x "$root/target/release/loadstone" ]]; then
-    bin="$root/target/release/loadstone"
 else
-    bin=""
+    cargo_bin=""
+    if [[ "${LOADSTONE_NO_BUILD:-0}" != "1" ]]; then
+        cargo_bin="$(find_cargo)"
+    fi
+
+    if [[ -n "$cargo_bin" ]]; then
+        # Reject cargo versions too old to read this project's Cargo.lock (v4).
+        cargo_version="$("$cargo_bin" --version 2>/dev/null | awk '{print $2}')"
+        cargo_major="${cargo_version%%.*}"
+        cargo_rest="${cargo_version#*.}"
+        cargo_minor="${cargo_rest%%.*}"
+        if [[ -n "$cargo_version" ]] &&
+            { [[ "$cargo_major" -lt 1 ]] ||
+                { [[ "$cargo_major" -eq 1 ]] && [[ "$cargo_minor" -lt 80 ]]; }; }; then
+            echo "loadstone: cargo $cargo_version at $cargo_bin is too old for this project (need 1.80+)." >&2
+            echo "loadstone: install/update Rust from https://rustup.rs, or set CARGO/LOADSTONE_BIN." >&2
+            cargo_bin=""
+        fi
+    fi
+
+    if [[ -n "$cargo_bin" ]]; then
+        "$cargo_bin" build --release --quiet --manifest-path "$root/Cargo.toml" --bin loadstone
+        bin="$existing"
+    elif [[ -x "$existing" ]]; then
+        bin="$existing"
+    else
+        bin=""
+    fi
 fi
 
 if [[ -z "$bin" ]]; then

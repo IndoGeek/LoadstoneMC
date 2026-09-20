@@ -74,7 +74,12 @@ needed and forwards every flag to it, so `./loadstone` is enough:
 
 # Or: LOADSTONE_BIN=/path/to/loadstone ./loadstone          # prebuilt binary
 #     LOADSTONE_NO_BUILD=1 ./loadstone                     # do not invoke cargo
+#     CARGO=/path/to/cargo ./loadstone                     # pick a specific cargo
 ```
+
+The launcher prefers the rustup toolchain (`~/.cargo/bin/cargo`) over a possibly
+older distro `cargo`, and falls back to an existing `target/release/loadstone`
+binary if the only cargo it can find is too old (this project needs 1.80+).
 
 ### Prebuilt binaries
 
