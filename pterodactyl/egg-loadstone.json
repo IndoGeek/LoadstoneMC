@@ -1,0 +1,92 @@
+{
+    "_comment": "LoadstoneMC Pterodactyl egg. Import it from Nests -> Import Egg. The install script downloads a prebuilt release binary from GitHub; there is no Java or build step.",
+    "meta": {
+        "version": "PTDL_v2",
+        "update_url": null
+    },
+    "exported_at": "2026-09-20T00:00:00+00:00",
+    "name": "LoadstoneMC",
+    "author": "IndoGeek@github",
+    "description": "A Minecraft: Java Edition 1.21.11 (protocol 774) server written from scratch in Rust. Runs a native binary; no Java runtime is required.",
+    "features": null,
+    "docker_images": {
+        "Debian": "ghcr.io/pterodactyl/yolks:debian"
+    },
+    "file_denylist": [],
+    "startup": "./loadstone --bind 0.0.0.0:{{SERVER_PORT}} --motd \"{{MOTD}}\" --max-players {{MAX_PLAYERS}} --online-mode={{ONLINE_MODE}} --save-interval {{SAVE_INTERVAL}} {{EXTRA_ARGS}}",
+    "config": {
+        "files": "{}",
+        "startup": "{\"done\": \"loadstone server listening on\"}",
+        "logs": "{}",
+        "stop": "stop"
+    },
+    "scripts": {
+        "installation": {
+            "script": "#!/bin/ash\nset -e\n\ncd /mnt/server || exit 1\n\nARCH=\"$(uname -m)\"\ncase \"$ARCH\" in\n  x86_64 | amd64) TARGET=\"x86_64-unknown-linux-gnu\" ;;\n  aarch64 | arm64) TARGET=\"aarch64-unknown-linux-gnu\" ;;\n  *)\n    echo \"Unsupported CPU architecture: $ARCH\"\n    exit 1\n    ;;\n  esac\n\nURL=\"{{DOWNLOAD_URL}}\"\nif [ -z \"$URL\" ] || [ \"$URL\" = \"latest\" ]; then\n  URL=\"https://github.com/IndoGeek/LoadstoneMC/releases/latest/download/loadstone-${TARGET}.tar.gz\"\nfi\n\necho \"Downloading LoadstoneMC from $URL\"\ncurl -fsSL \"$URL\" -o /tmp/loadstone.tar.gz\ntar -xzf /tmp/loadstone.tar.gz -C /mnt/server --strip-components=1\nrm -f /tmp/loadstone.tar.gz\nchmod +x /mnt/server/loadstone\n\n[ -d /mnt/server/world ] || mkdir -p /mnt/server/world\n\necho \"LoadstoneMC installed.\"\n",
+            "container": "ghcr.io/pterodactyl/installers:alpine",
+            "entrypoint": "ash"
+        }
+    },
+    "variables": [
+        {
+            "name": "MOTD",
+            "description": "Server list message of the day.",
+            "env_variable": "MOTD",
+            "default_value": "A LoadstoneMC server",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "required|string|max:120",
+            "field_type": "text"
+        },
+        {
+            "name": "Max players",
+            "description": "Player count shown in the server list.",
+            "env_variable": "MAX_PLAYERS",
+            "default_value": "20",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "required|integer|between:1,100000",
+            "field_type": "text"
+        },
+        {
+            "name": "Online mode",
+            "description": "true encrypts connections and verifies accounts with Mojang; false allows offline clients.",
+            "env_variable": "ONLINE_MODE",
+            "default_value": "false",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "required|in:true,false",
+            "field_type": "text"
+        },
+        {
+            "name": "Save interval",
+            "description": "Seconds between automatic saves of dirty chunks (0 disables autosave).",
+            "env_variable": "SAVE_INTERVAL",
+            "default_value": "30",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "required|integer|between:0,86400",
+            "field_type": "text"
+        },
+        {
+            "name": "Extra arguments",
+            "description": "Any additional server flags, for example: --seed 1234 --world world2",
+            "env_variable": "EXTRA_ARGS",
+            "default_value": "",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "nullable|string|max:255",
+            "field_type": "text"
+        },
+        {
+            "name": "Download URL",
+            "description": "Override the release archive to install. Leave empty to use the latest GitHub release for this machine's architecture.",
+            "env_variable": "DOWNLOAD_URL",
+            "default_value": "",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "nullable|string|max:255",
+            "field_type": "text"
+        }
+    ]
+}

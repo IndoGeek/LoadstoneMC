@@ -968,9 +968,11 @@ impl Packet for PlayDisconnect {
 
 // ── Entity packets ──────────────────────────────────────────────────────────
 
-/// Entity type id of `minecraft:player`, as ordered in the 1.21.11 entity
-/// registry the client is fed at login.
-pub const ENTITY_TYPE_PLAYER: i32 = 117;
+/// Entity type id of `minecraft:player` in the 1.21.11 `minecraft:entity_type`
+/// registry. (The registry is static, not synchronized, so this comes from the
+/// vanilla data generator's `registries.json`; an earlier value of 117 was the
+/// id for `minecraft:slime`.)
+pub const ENTITY_TYPE_PLAYER: i32 = 155;
 
 /// S->C Spawn Entity (id 0x01): a player (or any entity) appears in the world.
 /// In protocol 774 there is no dedicated player spawn packet; other players are
@@ -1003,10 +1005,25 @@ impl SpawnEntity {
         yaw: f32,
         pitch: f32,
     ) -> Self {
+        Self::mob(entity_id, uuid, ENTITY_TYPE_PLAYER, x, y, z, yaw, pitch)
+    }
+
+    /// Spawn any entity type at `(x, y, z)` with yaw/pitch in degrees.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mob(
+        entity_id: i32,
+        uuid: Uuid,
+        entity_type: i32,
+        x: f64,
+        y: f64,
+        z: f64,
+        yaw: f32,
+        pitch: f32,
+    ) -> Self {
         Self {
             entity_id,
             uuid,
-            entity_type: ENTITY_TYPE_PLAYER,
+            entity_type,
             x,
             y,
             z,

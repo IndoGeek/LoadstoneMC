@@ -1,4 +1,6 @@
 /target
+/dist
+/world/
 **/*.rs.bk
 .env
 data/*.jar

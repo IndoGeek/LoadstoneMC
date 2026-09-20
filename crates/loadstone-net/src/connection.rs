@@ -1,10 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
-use loadstone_world::World;
+use loadstone_world::{EntityStore, World};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -47,6 +47,9 @@ pub struct SharedPlayer {
     pub z: f64,
     pub yaw: f32,
     pub pitch: f32,
+    /// Mobs this player currently knows about, so the entity ticker can send
+    /// `add_entity` exactly once and `remove_entities` when they leave view.
+    pub visible_entities: HashSet<i32>,
     pub out: mpsc::UnboundedSender<(i32, Vec<u8>)>,
 }
 
@@ -70,12 +73,19 @@ pub struct ConnectionConfig {
     pub sessionserver_url: String,
     /// The shared block world, edited live by every player.
     pub world: Arc<Mutex<World>>,
+    /// The shared mob population, simulated by the entity ticker.
+    pub entities: Arc<Mutex<EntityStore>>,
     /// The shared player registry (entity ids, positions, outbound channels).
     pub state: Arc<Mutex<ServerState>>,
 }
 
 impl Default for ConnectionConfig {
     fn default() -> Self {
+        // Populate the default world so tests and an unconfigured server have
+        // mobs to stream.
+        let mut world = World::new();
+        let mut entities = EntityStore::new();
+        entities.populate(&mut world);
         Self {
             motd: "A LoadstoneMC Server".to_string(),
             max_players: 20,
@@ -83,7 +93,8 @@ impl Default for ConnectionConfig {
             online_mode: false,
             sessionserver_url: "https://sessionserver.mojang.com/session/minecraft/hasJoined"
                 .to_string(),
-            world: Arc::new(Mutex::new(World::new())),
+            world: Arc::new(Mutex::new(world)),
+            entities: Arc::new(Mutex::new(entities)),
             state: Arc::new(Mutex::new(ServerState::default())),
         }
     }

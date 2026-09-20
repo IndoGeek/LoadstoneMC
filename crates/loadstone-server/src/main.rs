@@ -3,9 +3,9 @@ use std::time::Duration;
 
 use anyhow::Context;
 use clap::Parser;
-use loadstone_net::{run_connection, ConnectionConfig};
+use loadstone_net::{run_connection, tick_entities, ConnectionConfig};
 use loadstone_protocol::{MINECRAFT_VERSION, PROTOCOL_VERSION};
-use loadstone_world::{world, World};
+use loadstone_world::{world, EntityStore, World};
 use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 
@@ -25,7 +25,14 @@ struct Args {
     max_players: i32,
 
     /// Require encryption and verify accounts against Mojang's session server.
-    #[arg(long, default_value_t = false)]
+    /// Accepts a bare flag or an explicit `--online-mode=true|false` so a
+    /// process manager can pass the value from a variable.
+    #[arg(
+        long,
+        default_value_t = false,
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
     online_mode: bool,
 
     /// Base URL used for Mojang-style session verification (`hasJoined`).
@@ -75,6 +82,10 @@ async fn main() -> anyhow::Result<()> {
         "world ready"
     );
 
+    let mut entities = EntityStore::new();
+    entities.populate(&mut world);
+    info!(mobs = entities.len(), "spawned mobs");
+
     let net_config = ConnectionConfig {
         motd: args.motd,
         max_players: args.max_players,
@@ -82,7 +93,8 @@ async fn main() -> anyhow::Result<()> {
         online_mode: args.online_mode,
         sessionserver_url: args.sessionserver_url,
         world: std::sync::Arc::new(std::sync::Mutex::new(world)),
-        ..Default::default()
+        entities: std::sync::Arc::new(std::sync::Mutex::new(entities)),
+        state: Default::default(),
     };
     let world_handle = net_config.world.clone();
 
@@ -100,11 +112,15 @@ async fn main() -> anyhow::Result<()> {
     if args.save_interval > 0 {
         spawn_autosave(world_handle.clone(), world_dir.clone(), args.save_interval);
     }
+    spawn_entity_ticker(net_config.clone());
+
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
 
     loop {
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
-                info!("interrupt received, saving world");
+            _ = &mut shutdown => {
+                info!("shutdown requested, saving world");
                 break;
             }
             accepted = listener.accept() => {
@@ -127,6 +143,65 @@ async fn main() -> anyhow::Result<()> {
 
     save_world(&world_handle, &world_dir, true);
     Ok(())
+}
+
+/// Resolves when the server should shut down: on Ctrl-C, on `SIGTERM`, or when
+/// `stop`/`exit`/`quit` is typed on stdin (which is how Pterodactyl asks a
+/// server to stop). Reaching end-of-file on stdin is not a shutdown signal, so
+/// the server keeps running when it has no controlling terminal.
+async fn shutdown_signal() {
+    use tokio::io::AsyncBufReadExt as _;
+
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    let stdin_stop = async {
+        let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
+        loop {
+            match lines.next_line().await {
+                Ok(Some(line)) => {
+                    let command = line.trim().to_ascii_lowercase();
+                    if matches!(command.as_str(), "stop" | "exit" | "quit" | "shutdown") {
+                        break;
+                    }
+                }
+                // EOF or a read error means no console is attached: wait forever
+                // rather than interpreting it as a stop request.
+                Ok(None) | Err(_) => std::future::pending::<()>().await,
+            }
+        }
+    };
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+        _ = stdin_stop => {}
+    }
+}
+
+/// Steps the shared mob simulation every server tick (50 ms) and streams the
+/// results to players. It idles while nobody is online.
+fn spawn_entity_ticker(config: ConnectionConfig) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_millis(50));
+        loop {
+            ticker.tick().await;
+            tick_entities(&config);
+        }
+    });
 }
 
 /// Periodically writes dirty chunks while the server runs.

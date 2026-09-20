@@ -12,7 +12,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use loadstone_net::auth::compute_server_id;
-use loadstone_net::{run_connection, Cfb8, ConnectionConfig};
+use loadstone_net::{run_connection, tick_entities, Cfb8, ConnectionConfig};
 use loadstone_protocol::packets::configuration::{
     AcknowledgeFinishConfiguration, ClientInformation, ClientboundKnownPacks, CustomPayload,
     FeatureFlags, FinishConfiguration, RegistryData, ServerboundKnownPacks, UpdateTags,
@@ -896,6 +896,55 @@ async fn chunks_stream_across_chunk_borders() {
     }
 
     drop(client);
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mobs_spawn_and_move_for_joining_players() {
+    let config = base_config(false);
+    let (addr, server) = spawn_server_multi(config.clone()).await;
+
+    // Join before the ticker runs so the deterministic join snapshot above is
+    // not interleaved with mob traffic.
+    let (mut client, _uuid, _snapshot) = offline_join(&addr, "Alice").await;
+
+    let ticker_config = config.clone();
+    let ticker = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(25));
+        loop {
+            interval.tick().await;
+            tick_entities(&ticker_config);
+        }
+    });
+
+    // The seven starting mobs are all within the player's loaded view.
+    let mut kinds = Vec::new();
+    let mut moved = std::collections::HashSet::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while (kinds.len() < 7 || moved.is_empty()) && tokio::time::Instant::now() < deadline {
+        let (id, body) = tokio::time::timeout(Duration::from_secs(2), client.next_event())
+            .await
+            .expect("timeout waiting for mob traffic");
+        if id == SpawnEntity::ID {
+            let spawn = SpawnEntity::decode(&mut PacketReader::new(&body)).unwrap();
+            assert_ne!(
+                spawn.entity_type, ENTITY_TYPE_PLAYER,
+                "mobs must not claim the player type"
+            );
+            kinds.push(spawn.entity_type);
+        } else if id == SyncEntityPosition::ID {
+            let sync = SyncEntityPosition::decode(&mut PacketReader::new(&body)).unwrap();
+            moved.insert(sync.entity_id);
+        }
+    }
+
+    kinds.sort_unstable();
+    // pig x2, cow, sheep, chicken x2, zombie (1.21.11 entity_type ids).
+    assert_eq!(kinds, vec![26, 26, 30, 100, 100, 111, 150]);
+    assert!(!moved.is_empty(), "no mob movement was streamed");
+
+    drop(client);
+    ticker.abort();
     server.abort();
 }
 

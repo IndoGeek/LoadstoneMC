@@ -18,7 +18,7 @@ use loadstone_protocol::packets::play::{
 use loadstone_protocol::Nbt;
 use loadstone_protocol::{Packet, PacketReader, PacketWriter};
 use loadstone_world::encode::{self, BLOCK_AIR, BLOCK_COBBLESTONE};
-use loadstone_world::{Chunk, ChunkPos};
+use loadstone_world::{Chunk, ChunkPos, Entity};
 use tokio::sync::mpsc;
 use tracing::{debug, info};
 use uuid::Uuid;
@@ -156,6 +156,7 @@ pub async fn play_phase(
                 z: spawn.2,
                 yaw: 0.0,
                 pitch: 0.0,
+                visible_entities: HashSet::new(),
                 out,
             },
         );
@@ -465,6 +466,94 @@ fn broadcast_except(config: &ConnectionConfig, source: Uuid, packet_id: i32, bod
             continue;
         }
         let _ = player.out.send((packet_id, body.clone()));
+    }
+}
+
+/// Advances the shared mob simulation by one tick and streams the results to
+/// every player. It is a no-op while nobody is online, and each player only
+/// learns about mobs whose chunk is inside their loaded view, so `add_entity`
+/// always precedes any movement for that mob.
+pub fn tick_entities(config: &ConnectionConfig) {
+    let targets: Vec<(f64, f64, f64)> = {
+        let state = config.state.lock().unwrap();
+        if state.players.is_empty() {
+            return;
+        }
+        state
+            .players
+            .values()
+            .map(|player| (player.x, player.y, player.z))
+            .collect()
+    };
+
+    let mobs: Vec<Entity> = {
+        let mut world = config.world.lock().unwrap();
+        let mut entities = config.entities.lock().unwrap();
+        entities.tick(&mut world, &targets);
+        entities.mobs().cloned().collect()
+    };
+    if mobs.is_empty() {
+        return;
+    }
+
+    let mut state = config.state.lock().unwrap();
+    for player in state.players.values_mut() {
+        let (center_x, center_z) = chunk_of(player.x, player.z);
+        let visible: HashSet<i32> = mobs
+            .iter()
+            .filter(|mob| {
+                let (cx, cz) = chunk_of(mob.x, mob.z);
+                (cx - center_x).abs() <= VIEW_DISTANCE && (cz - center_z).abs() <= VIEW_DISTANCE
+            })
+            .map(|mob| mob.id)
+            .collect();
+
+        let removed: Vec<i32> = player
+            .visible_entities
+            .difference(&visible)
+            .copied()
+            .collect();
+        if !removed.is_empty() {
+            let body = encode_body(&RemoveEntities {
+                entity_ids: removed,
+            });
+            let _ = player.out.send((RemoveEntities::ID, body));
+        }
+
+        for mob in mobs.iter().filter(|mob| visible.contains(&mob.id)) {
+            if !player.visible_entities.contains(&mob.id) {
+                let spawn = SpawnEntity::mob(
+                    mob.id,
+                    Uuid::from_bytes(mob.uuid),
+                    mob.kind.entity_type_id(),
+                    mob.x,
+                    mob.y,
+                    mob.z,
+                    mob.yaw,
+                    mob.pitch,
+                );
+                let _ = player.out.send((SpawnEntity::ID, encode_body(&spawn)));
+            }
+            if mob.moved {
+                let sync = SyncEntityPosition {
+                    entity_id: mob.id,
+                    x: mob.x,
+                    y: mob.y,
+                    z: mob.z,
+                    vx: mob.vx,
+                    vy: mob.vy,
+                    vz: mob.vz,
+                    yaw: mob.yaw,
+                    pitch: mob.pitch,
+                    on_ground: mob.on_ground,
+                };
+                let _ = player
+                    .out
+                    .send((SyncEntityPosition::ID, encode_body(&sync)));
+            }
+        }
+
+        player.visible_entities = visible;
     }
 }
 

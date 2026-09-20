@@ -12,3 +12,4 @@ pub use connection::{
 };
 pub use crypto::{Cfb8, EncryptedStream};
 pub use error::NetError;
+pub use play::tick_entities;

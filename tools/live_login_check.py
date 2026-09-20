@@ -376,6 +376,7 @@ def drive_into_play(client: Client, name: str, expected_entity_id: int | None = 
     login = position = health = welcome = None
     acked = False
     surfaces = {}
+    mob_spawns = {}
     while chunks < 9 or None in (login, position, health, welcome):
         packet_id, body = client.read_packet()
         if packet_id == PKT_PLAY_LOGIN:
@@ -385,6 +386,11 @@ def drive_into_play(client: Client, name: str, expected_entity_id: int | None = 
             chunk_x, chunk_z, heights = parse_chunk_heightmaps(body)
             if heights:
                 surfaces[(chunk_x, chunk_z)] = heights
+        elif packet_id == PKT_PLAY_SPAWN_ENTITY:
+            entity_id, size = read_varint(body)
+            entity_type, _ = read_varint(body, size + 16)
+            if entity_type != 155:  # 155 is minecraft:player
+                mob_spawns[entity_id] = entity_type
         elif packet_id == PKT_PLAY_CHUNK_BATCH_START:
             pass
         elif packet_id == PKT_PLAY_POSITION:
@@ -431,7 +437,7 @@ def drive_into_play(client: Client, name: str, expected_entity_id: int | None = 
 
     check(name.encode() in welcome and b"Welcome" in welcome,
           "a chat welcome greets the player by name")
-    return entity_id, pos
+    return entity_id, pos, mob_spawns
 
 
 def chat_echo(client: Client, name: str, message: str) -> None:
@@ -471,7 +477,7 @@ def block_round_trip(client: Client, surface_y: int) -> None:
         + bytes([1])
         + write_varint(1),
     )
-    packet_id, body = client.read_packet()
+    packet_id, body = await_block_change_packet(client)
     if not check(packet_id == PKT_PLAY_BLOCK_CHANGE, "digging answers with a block change",
                  f"id {packet_id:#04x}"):
         raise AssertionError("missing block change after dig")
@@ -492,7 +498,7 @@ def block_round_trip(client: Client, surface_y: int) -> None:
         + b"\x00\x00"                                        # inside block, world border
         + write_varint(2),                                   # sequence
     )
-    packet_id, body = client.read_packet()
+    packet_id, body = await_block_change_packet(client)
     if not check(packet_id == PKT_PLAY_BLOCK_CHANGE,
                  "placing answers with a block change", f"id {packet_id:#04x}"):
         raise AssertionError("missing block change after place")
@@ -519,6 +525,25 @@ def next_play_packet(client: Client) -> tuple[int, bytes]:
         return packet_id, body
 
 
+def await_chunk_packet(client: Client, wanted: int) -> tuple[int, bytes]:
+    """Reads Play packets until `wanted` arrives, skipping the entity traffic
+    the mob ticker interleaves with chunk streaming."""
+    entity_traffic = {
+        PKT_PLAY_SPAWN_ENTITY,
+        PKT_PLAY_SYNC_ENTITY_POSITION,
+        PKT_PLAY_REMOVE_ENTITIES,
+        PKT_PLAY_ENTITY_METADATA,
+        PKT_PLAY_BUNDLE_DELIMITER,
+        PKT_PLAY_ENTITY_HEAD_ROTATION,
+    }
+    while True:
+        packet_id, body = next_play_packet(client)
+        if packet_id == wanted:
+            return packet_id, body
+        if packet_id not in entity_traffic:
+            return packet_id, body
+
+
 def await_spawn(client: Client, expected_uuid: uuid.UUID) -> int:
     """Reads until the given player's spawn_entity appears, returning their id."""
     while True:
@@ -529,7 +554,7 @@ def await_spawn(client: Client, expected_uuid: uuid.UUID) -> int:
         spawn_uuid = uuid.UUID(bytes=body[size:size + 16])
         entity_type, _ = read_varint(body, size + 16)
         if spawn_uuid == expected_uuid:
-            check(entity_type == 117, "the other player spawns as entity type 117",
+            check(entity_type == 155, "the other player spawns as minecraft:player (155)",
                   str(entity_type))
             return entity_id
 
@@ -549,11 +574,56 @@ def await_sync(client: Client, entity_id: int) -> tuple[float, float, float]:
 
 def await_block_change(client: Client) -> int:
     """Reads until a block_change, returning the packed location."""
+    packet_id, body = await_block_change_packet(client)
+    (location,) = struct.unpack(">q", body[:8])
+    return location
+
+
+def await_block_change_packet(client: Client) -> tuple[int, bytes]:
+    """Reads Play packets until a block_change arrives, skipping the mob and
+    keep-alive traffic the entity ticker interleaves."""
     while True:
         packet_id, body = next_play_packet(client)
         if packet_id == PKT_PLAY_BLOCK_CHANGE:
-            (location,) = struct.unpack(">q", body[:8])
-            return location
+            return packet_id, body
+
+
+def check_mobs(host: str, port: int) -> None:
+    """A joining player is told about the starting mob population and sees it
+    move. Mobs must use the `minecraft:entity_type` ids and never the player id."""
+    client = Client(host, port)
+    try:
+        handshake(client, host, port, 2)
+        login_start(client, "MobWatch")
+        read_set_compression(client)
+        read_login_success(client)
+        client.write_packet(PKT_LOGIN_ACKNOWLEDGED)
+        complete_configuration(client)
+        _, _, spawns = drive_into_play(client, "MobWatch", expected_entity_id=None)
+
+        spawned = dict(spawns)
+        moved = set()
+        # The server ticks at 20 Hz; wait for the whole population plus one move.
+        while len(spawned) < 7 or not moved:
+            packet_id, body = next_play_packet(client)
+            if packet_id == PKT_PLAY_SPAWN_ENTITY:
+                entity_id, size = read_varint(body)
+                entity_type, _ = read_varint(body, size + 16)
+                if entity_type != 155:
+                    spawned[entity_id] = entity_type
+            elif packet_id == PKT_PLAY_SYNC_ENTITY_POSITION:
+                entity_id, _ = read_varint(body)
+                moved.add(entity_id)
+
+        expected = [26, 30, 100, 111, 150]  # chicken, cow, pig, sheep, zombie
+        distinct = sorted(set(spawned.values()))
+        check(distinct == expected,
+              "the starting mobs use the 1.21.11 entity_type ids", str(distinct))
+        check(moved and moved <= set(spawned),
+              "mob movement is streamed for the spawned entities",
+              f"moved {sorted(moved)} of {sorted(spawned)}")
+    finally:
+        client.close()
 
 
 def await_player_remove(client: Client) -> bool:
@@ -576,7 +646,7 @@ def check_two_players(host: str, port: int) -> None:
         read_login_success(alice)
         alice.write_packet(PKT_LOGIN_ACKNOWLEDGED)
         complete_configuration(alice)
-        alice_entity, _ = drive_into_play(alice, "Alice", expected_entity_id=None)
+        alice_entity, _alice_pos, _alice_mobs = drive_into_play(alice, "Alice", expected_entity_id=None)
 
         handshake(bob, host, port, 2)
         bob_uuid = login_start(bob, "Bob")
@@ -584,7 +654,7 @@ def check_two_players(host: str, port: int) -> None:
         read_login_success(bob)
         bob.write_packet(PKT_LOGIN_ACKNOWLEDGED)
         complete_configuration(bob)
-        bob_entity_login, bob_position = drive_into_play(bob, "Bob", expected_entity_id=None)
+        bob_entity_login, bob_position, _bob_mobs = drive_into_play(bob, "Bob", expected_entity_id=None)
 
         check(alice_entity != bob_entity_login,
               "players receive distinct entity ids", f"{alice_entity} == {bob_entity_login}")
@@ -636,7 +706,7 @@ def check_chunk_streaming(host: str, port: int) -> None:
         # Walk east, from chunk (0,0) into chunk (1,0).
         client.write_packet(PKT_PLAY_POSITION_SB, struct.pack(">3d", 24.5, 65.0, 8.5) + b"\x01")
 
-        packet_id, body = next_play_packet(client)
+        packet_id, body = await_chunk_packet(client, PKT_PLAY_SET_CHUNK_CACHE_CENTER)
         if not check(packet_id == PKT_PLAY_SET_CHUNK_CACHE_CENTER,
                      "crossing a chunk border announces the new centre",
                      f"id {packet_id:#04x}"):
@@ -646,7 +716,7 @@ def check_chunk_streaming(host: str, port: int) -> None:
         check((center_x, center_z) == (1, 0), "the view centre follows the player",
               f"({center_x}, {center_z})")
 
-        packet_id, _ = next_play_packet(client)
+        packet_id, _ = await_chunk_packet(client, PKT_PLAY_CHUNK_BATCH_START)
         check(packet_id == PKT_PLAY_CHUNK_BATCH_START, "new chunks arrive as a batch",
               f"id {packet_id:#04x}")
 
@@ -665,7 +735,7 @@ def check_chunk_streaming(host: str, port: int) -> None:
 
         unloaded = []
         for _ in range(3):
-            packet_id, body = next_play_packet(client)
+            packet_id, body = await_chunk_packet(client, PKT_PLAY_UNLOAD_CHUNK)
             if not check(packet_id == PKT_PLAY_UNLOAD_CHUNK,
                          "columns that left view are unloaded", f"id {packet_id:#04x}"):
                 return
@@ -725,7 +795,7 @@ def check_offline_login(host: str, port: int, name: str) -> None:
         registries = complete_configuration(client)
         check(registries == 23, "all synchronized registries are delivered",
               f"{registries} registries")
-        _, position = drive_into_play(client, name)
+        _, position, _mobs = drive_into_play(client, name)
         chat_echo(client, name, "hello from live check")
         block_round_trip(client, int(position[1]) - 1)
     finally:
@@ -780,7 +850,7 @@ def check_online_login(host: str, port: int, name: str, session: "MockSession") 
         registries = complete_configuration(client)
         check(registries == 23, "all synchronized registries are delivered",
               f"{registries} registries")
-        _, position = drive_into_play(client, name)
+        _, position, _mobs = drive_into_play(client, name)
         chat_echo(client, name, "hello from live check")
         block_round_trip(client, int(position[1]) - 1)
     finally:
@@ -1065,6 +1135,7 @@ def main() -> int:
             check_offline_login(args.host, args.port, args.name)
             check_chunk_streaming(args.host, args.port)
             check_two_players(args.host, args.port)
+            check_mobs(args.host, args.port)
             if process is not None:
                 check_persistence(process)
         elif session is not None:

@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+#
+# Start the LoadstoneMC server from a source checkout.
+#
+#   ./loadstone [server flags...]
+#
+# Any flags are passed straight through, for example:
+#
+#   ./loadstone --bind 0.0.0.0:25565 --motd "My server"
+#   ./loadstone --online-mode --world world
+#
+# If cargo is available the release binary is rebuilt (incrementally) before it
+# is run. Set LOADSTONE_BIN to run a prebuilt binary instead, or
+# LOADSTONE_NO_BUILD=1 to run the existing build without invoking cargo.
+set -euo pipefail
+
+root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+if [[ -n "${LOADSTONE_BIN:-}" ]]; then
+    bin="$LOADSTONE_BIN"
+elif [[ "${LOADSTONE_NO_BUILD:-0}" != "1" ]] && command -v cargo >/dev/null 2>&1 && [[ -f "$root/Cargo.toml" ]]; then
+    cargo build --release --quiet --manifest-path "$root/Cargo.toml" --bin loadstone
+    bin="$root/target/release/loadstone"
+elif [[ -x "$root/target/release/loadstone" ]]; then
+    bin="$root/target/release/loadstone"
+else
+    bin=""
+fi
+
+if [[ -z "$bin" ]]; then
+    echo "loadstone: no binary available." >&2
+    echo "loadstone: install Rust (https://rustup.rs) and re-run, or set LOADSTONE_BIN." >&2
+    exit 1
+fi
+
+exec "$bin" "$@"

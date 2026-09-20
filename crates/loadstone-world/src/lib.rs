@@ -3,9 +3,11 @@
 pub mod anvil;
 pub mod blocks;
 pub mod encode;
+pub mod entity;
 pub mod terrain;
 pub mod world;
 
+pub use entity::{Entity, EntityKind, EntityStore};
 pub use world::World;
 
 pub const CHUNK_SIZE_X: usize = 16;

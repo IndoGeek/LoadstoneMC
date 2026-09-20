@@ -18,7 +18,7 @@ small, fast, low-overhead core in the spirit of Pumpkin and Steel.
 | Chunk streaming as players cross chunk borders (batched loads, unloads, view centre) | works |
 | Terrain generation (deterministic value-noise hills, bedrock/stone/dirt/grass layers) | works |
 | World persistence (vanilla Anvil region files, seed sidecar, autosave, save on shutdown) | works |
-| Non-player entities, mob AI | not implemented |
+| Non-player entities (pigs, cows, sheep, chickens, zombies) with gravity, collision, wander/chase AI | works |
 
 A vanilla client can ping the server, complete login, and finish the whole
 Configuration handshake: it negotiates `minecraft:core`, receives every
@@ -46,7 +46,13 @@ announced with `player_remove` + `remove_entities`. Generated-and-edited chunks
 are persisted in vanilla Anvil format: dirty chunks are written to
 `<world>/region/r.X.Z.mca` periodically and on shutdown, and the seed is kept in
 a `<world>/loadstone.seed` sidecar so a restart regenerates the same terrain and
-overlays the saved edits.
+overlays the saved edits. A small deterministic mob population (pigs, cows,
+sheep, chickens and a zombie) is spawned around the world spawn and simulated at
+20 Hz: each mob falls under gravity, collides with blocks, wanders around its
+home or, if hostile, walks towards the nearest player within 16 blocks. Mobs
+are streamed to each player as `spawn_entity` when their chunk enters that
+player's view and kept in step with `sync_entity_position`, then removed with
+`remove_entities` when they leave it; the ticker idles while nobody is online.
 
 ## Build and run
 
@@ -57,10 +63,43 @@ cargo build --release
 cargo run -p loadstone-server --release -- --bind 0.0.0.0:25565 --motd "LoadstoneMC"
 ```
 
+From the project root, the `loadstone` launcher builds the release binary if
+needed and forwards every flag to it, so `./loadstone` is enough:
+
 ```bash
+./loadstone --bind 0.0.0.0:25565 --motd "LoadstoneMC"
+
 # Online mode: encrypts the connection and verifies accounts with Mojang.
-cargo run -p loadstone-server --release -- --online-mode
+./loadstone --online-mode
+
+# Or: LOADSTONE_BIN=/path/to/loadstone ./loadstone          # prebuilt binary
+#     LOADSTONE_NO_BUILD=1 ./loadstone                     # do not invoke cargo
 ```
+
+### Prebuilt binaries
+
+Release archives are published on GitHub for Linux (x86-64, arm64), macOS
+(x86-64, arm64) and Windows (x86-64). Each archive contains the self-contained
+`loadstone` server binary (no Java needed), the README, the LICENSE and the
+Pterodactyl egg:
+
+```bash
+tar -xzf loadstone-x86_64-unknown-linux-gnu.tar.gz
+cd loadstone-x86_64-unknown-linux-gnu
+./loadstone --bind 0.0.0.0:25565
+```
+
+`tools/package.sh [target-triple]` builds the same archive locally and writes it
+to `dist/`.
+
+### Pterodactyl
+
+`pterodactyl/egg-loadstone.json` is a ready-to-import egg. The installer detects
+the machine architecture, downloads the matching release binary and makes it
+executable; the runtime uses the Debian yolks image and needs no Java. The egg
+exposes the MOTD, max players, online mode, save interval and extra arguments as
+variables, binds the server to the allocated `SERVER_PORT`, and stops it
+gracefully by sending `stop` on stdin. Import it from **Nests → Import Egg**.
 
 | Flag | Default | Meaning |
 |---|---|---|
@@ -73,8 +112,9 @@ cargo run -p loadstone-server --release -- --online-mode
 | `--seed` | saved seed, else `0` | Terrain seed for a new world |
 | `--save-interval` | `30` | Seconds between autosaves of dirty chunks (`0` disables) |
 
-The server saves dirty chunks on a timer and force-saves everything on
-`Ctrl-C`/SIGINT. World files are vanilla-compatible Anvil regions
+The server saves dirty chunks on a timer and force-saves everything on shutdown:
+`Ctrl-C`/SIGINT, `SIGTERM`, or `stop`/`exit`/`quit` typed on stdin (which is how
+Pterodactyl stops it). World files are vanilla-compatible Anvil regions
 (`DataVersion 4671`), so an existing vanilla 1.21.11 world can be dropped in and
 edited.
 
@@ -86,7 +126,7 @@ Logging is controlled by `RUST_LOG` (for example `RUST_LOG=loadstone=debug`).
 |---|---|
 | `loadstone-protocol` | Packet definitions, VarInt, packet reader/writer, compression |
 | `loadstone-net` | Connection lifecycle, framing, AES-128/CFB8, login flow, session auth |
-| `loadstone-world` | Terrain generation, the mutable world model, Anvil region persistence, and the 1.21.11 chunk wire format (paletted containers, heightmaps, sky light) |
+| `loadstone-world` | Terrain generation, the mutable world model, mob entities with gravity/collision/AI, Anvil region persistence, and the 1.21.11 chunk wire format (paletted containers, heightmaps, sky light) |
 | `loadstone-registry` | Synchronized registry and network tag data (embedded JSON) |
 | `loadstone-server` | The `loadstone` binary: CLI, listener, per-connection tasks |
 
@@ -121,9 +161,12 @@ health/hunger, the tab list entry, and the welcome chat line carrying the
 player's name. Another test walks one chunk east and checks that the view centre
 moves, the three newly visible columns are streamed as a batch, and the three
 that fell out of view are unloaded. A third test runs two clients against one
-server and checks that each sees the other spawn (`spawn_entity`, type 117), that
+server and checks that each sees the other spawn (`spawn_entity`, type 155), that
 movement arrives as an entity sync, that a block edit by one is broadcast to the
-other, and that a disconnect produces `player_remove` + `remove_entities`.
+other, and that a disconnect produces `player_remove` + `remove_entities`. A
+fourth test starts the entity ticker and checks that a joining player is sent all
+seven starting mobs with their `minecraft:entity_type` ids and then sees them
+move.
 
 `tools/live_login_check.py` does the same over a socket against a real running
 binary, with a client written independently of the server (Python `cryptography`):
@@ -138,9 +181,10 @@ It covers the server list ping, an offline login, chunk streaming as the player
 walks across a chunk border, an online login (key exchange → AES/CFB8 →
 `hasJoined` → compression → Login Success → acknowledgement → the full
 Configuration handshake → the Play state), a two-client shared-world check
-(presence, movement, shared block edit, disconnect), and both online-mode
-refusals: an unverified account, and a key exchange that does not echo the
-verify token. Offline mode then interrupts the server and inspects the Anvil
+(presence, movement, shared block edit, disconnect), a mob check (the seven
+starting entities spawn with the right registry type ids and move), and both
+online-mode refusals: an unverified account, and a key exchange that does not
+echo the verify token. Offline mode then interrupts the server and inspects the Anvil
 region it wrote, checking the 8 KiB header, a zlib payload with a `DataVersion`,
 and that both generated terrain and a player edit survived to disk. Exit status
 is non-zero if anything fails, so it can gate a release.
@@ -153,8 +197,11 @@ is non-zero if anything fails, so it can gate a release.
   additionally confirmed by capturing live traffic from a real 1.21.11 vanilla
   server.
 - Protocol 774 has no dedicated player-spawn packet: other players are
-  `spawn_entity` with entity type 117 (`minecraft:player`), sent inside a bundle
-  delimiter pair together with their tab-list entry and entity metadata.
+  `spawn_entity` with entity type 155 (`minecraft:player`), sent inside a bundle
+  delimiter pair together with their tab-list entry and entity metadata. The
+  `minecraft:entity_type` registry is static (not synchronized), so these ids
+  come from the vanilla data generator rather than the registries sent at login;
+  `minecraft:slime` is 117.
 - Chunk batches use `chunk_batch_start` id `0x0C` and `chunk_batch_finished` id
   `0x0B` (the latter carries a VarInt batch size, not a float). Note the finish
   id is lower than the start id, and `unload_chunk` sends chunk Z before chunk X.
@@ -192,9 +239,9 @@ is non-zero if anything fails, so it can gate a release.
 
 ## Roadmap
 
-1. **Game feel** — non-player entities and mob AI. Terrain generation and Anvil
-   persistence are in place; the next step is critters that wander, a broader
-   block set, and light/block-entity data in the saved chunks.
+1. **Game feel** — richer mobs. Terrain generation, Anvil persistence and a
+   first wander/chase mob population are in place; the next steps are combat and
+   damage, a broader block set, and light/block-entity data in the saved chunks.
 2. **Custom registries** — the current data is the vanilla set with NBT omitted;
    serving custom biomes/dimensions means emitting entry NBT as well.
 3. **Player data & chat** — verify the Mojang-signed session key chain for chat

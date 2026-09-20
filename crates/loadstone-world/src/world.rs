@@ -75,6 +75,11 @@ impl World {
         self.spawn
     }
 
+    /// The world Y of the topmost generated block of a column, ignoring edits.
+    pub fn surface_height(&self, x: i32, z: i32) -> i32 {
+        self.generator.surface_height(x, z)
+    }
+
     /// The cached chunk at `pos`, generating it if necessary.
     pub fn chunk(&mut self, pos: ChunkPos) -> &Chunk {
         self.chunks
