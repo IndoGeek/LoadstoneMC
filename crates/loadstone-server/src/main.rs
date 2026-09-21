@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use clap::{Parser, ValueEnum};
@@ -110,6 +110,9 @@ async fn main() -> anyhow::Result<()> {
         warn!("could not open logs/latest.log ({error}); logging to the console only");
     }
 
+    let started = Instant::now();
+
+    // Our own banner first, the way a fork does, then vanilla's sequence.
     info!(
         style = "banner",
         "LoadstoneMC {} \u{2014} Minecraft {}, protocol {}",
@@ -117,6 +120,10 @@ async fn main() -> anyhow::Result<()> {
         MINECRAFT_VERSION,
         PROTOCOL_VERSION
     );
+    // From here the lines are vanilla's start-up sequence, word for word, so a
+    // console reads the way an operator expects one to.
+    info!("Starting minecraft server version {MINECRAFT_VERSION}");
+    info!("Loading properties");
 
     // `server.properties` is the source of truth and the flags only override it
     // when they are given, which is how vanilla's own flags behave. The file is
@@ -190,6 +197,57 @@ async fn main() -> anyhow::Result<()> {
         }
     };
     let hardcore = props.boolean("hardcore");
+    info!(
+        "Default game type: {}",
+        properties::gamemode_name(gamemode).to_uppercase()
+    );
+
+    // Vanilla generates one keypair for the whole run and reuses it for every
+    // login. Doing it here keeps the line above honest and takes a 1024-bit key
+    // generation off the login path.
+    let server_keys = if online_mode {
+        info!("Generating keypair");
+        match loadstone_net::auth::generate_keys() {
+            Ok(keys) => Some(std::sync::Arc::new(keys)),
+            Err(error) => {
+                error!("failed to generate the server keypair: {error}");
+                log_file.flush();
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
+
+    // Vanilla prints the address it is about to bind, then binds.
+    info!("Starting Minecraft server on {}", vanilla_address(&bind));
+    if !online_mode {
+        // The same four warnings, for the same reason: this is a real hole.
+        warn!("**** SERVER IS RUNNING IN OFFLINE/INSECURE MODE!");
+        warn!("The server will make no attempt to authenticate usernames. Beware.");
+        warn!(
+            "While this makes the game possible to play without internet access, it also opens up the ability for hackers to connect with any username they choose."
+        );
+        warn!("To change this, set \"online-mode\" to \"true\" in the server.properties file.");
+    }
+
+    let listener = match TcpListener::bind(&bind).await {
+        Ok(listener) => listener,
+        Err(error) => {
+            warn!("**** FAILED TO BIND TO PORT!");
+            warn!("The exception was: {error}");
+            warn!("Perhaps a server is already running on that port?");
+            log_file.flush();
+            std::process::exit(1);
+        }
+    };
+
+    let preparing = Instant::now();
+    let level_name = world_dir
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| props.string("level-name"));
+    info!("Preparing level \"{level_name}\"");
 
     let seed = match args.seed {
         Some(seed) => seed,
@@ -199,6 +257,7 @@ async fn main() -> anyhow::Result<()> {
     if let Err(error) = world.load_from(&world_dir) {
         warn!(dir = %world_dir.display(), "failed to load world: {error}");
     }
+    info!("Loading {} persistent chunks...", world.chunk_count());
     info!(
         dir = %world_dir.display(),
         seed,
@@ -209,6 +268,11 @@ async fn main() -> anyhow::Result<()> {
     let mut entities = EntityStore::new();
     entities.populate(&mut world);
     info!(mobs = entities.len(), "spawned mobs");
+    info!("Time elapsed: {} ms", preparing.elapsed().as_millis());
+    info!(
+        "Done ({:.3}s)! For help, type \"help\"",
+        started.elapsed().as_secs_f64()
+    );
 
     let net_config = ConnectionConfig {
         motd,
@@ -219,28 +283,13 @@ async fn main() -> anyhow::Result<()> {
         compression_threshold: props.integer("network-compression-threshold"),
         gamemode,
         hardcore,
+        server_keys,
         sessionserver_url: args.sessionserver_url,
         world: std::sync::Arc::new(std::sync::Mutex::new(world)),
         entities: std::sync::Arc::new(std::sync::Mutex::new(entities)),
         state: Default::default(),
     };
     let world_handle = net_config.world.clone();
-
-    let listener = match TcpListener::bind(&bind).await {
-        Ok(listener) => listener,
-        Err(error) => {
-            error!("failed to bind {bind}: {error}");
-            log_file.flush();
-            std::process::exit(1);
-        }
-    };
-    info!(
-        version = MINECRAFT_VERSION,
-        protocol = PROTOCOL_VERSION,
-        online_mode,
-        motd = %net_config.motd,
-        "loadstone server listening on {bind}"
-    );
 
     if args.save_interval > 0 {
         spawn_autosave(world_handle.clone(), world_dir.clone(), args.save_interval);
@@ -253,7 +302,7 @@ async fn main() -> anyhow::Result<()> {
     loop {
         tokio::select! {
             _ = &mut shutdown => {
-                info!("shutdown requested, saving world");
+                info!("Stopping server");
                 break;
             }
             accepted = listener.accept() => {
@@ -274,12 +323,23 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    info!("Saving worlds");
     save_world(&world_handle, &world_dir, true);
-    info!("stopping the server");
     // Flush the file layer so the closing lines are on disk even if the process
     // is killed immediately after this returns.
     log_file.flush();
     Ok(())
+}
+
+/// How vanilla prints the address it is about to bind: `*:25565` when it is
+/// listening on every interface, otherwise `host:port`.
+fn vanilla_address(bind: &str) -> String {
+    match bind.rsplit_once(':') {
+        Some((host, port)) if host.is_empty() || host == "0.0.0.0" || host == "::" => {
+            format!("*:{port}")
+        }
+        _ => bind.to_string(),
+    }
 }
 
 /// Resolves when the server should shut down: on Ctrl-C, on `SIGTERM`, or when
@@ -302,10 +362,21 @@ async fn shutdown_signal() {
         for line in stdin.lock().lines() {
             match line {
                 Ok(line) => {
-                    let command = line.trim().to_ascii_lowercase();
-                    if matches!(command.as_str(), "stop" | "exit" | "quit" | "shutdown") {
-                        let _ = stop_tx.blocking_send(());
-                        return;
+                    let typed = line.trim();
+                    match typed.to_ascii_lowercase().as_str() {
+                        "stop" | "exit" | "quit" | "shutdown" => {
+                            let _ = stop_tx.blocking_send(());
+                            return;
+                        }
+                        "help" | "?" => info!(
+                            "Commands: stop (also exit, quit, shutdown), help. This server has no other console commands yet."
+                        ),
+                        "" => {}
+                        // Vanilla's wording for a command it does not know.
+                        _ => {
+                            info!("Unknown or incomplete command. See below for error");
+                            info!("{typed}<--[HERE]");
+                        }
                     }
                 }
                 // EOF or a read error means no console is attached: stop reading

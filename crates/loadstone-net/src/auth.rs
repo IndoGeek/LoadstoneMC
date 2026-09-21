@@ -16,6 +16,20 @@ pub struct ServerKeys {
     pub public_der: Vec<u8>,
 }
 
+impl std::fmt::Debug for ServerKeys {
+    /// Redacted on purpose. `ServerKeys` is reachable from `ConnectionConfig`,
+    /// whose `Debug` is printed in error paths, and a private key must never be
+    /// one accidental `{:?}` away from a log file.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServerKeys")
+            .field(
+                "public_der",
+                &format_args!("{} bytes", self.public_der.len()),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
 pub fn generate_keys() -> Result<ServerKeys, String> {
     use rand::rngs::OsRng;
     let mut rng = OsRng;

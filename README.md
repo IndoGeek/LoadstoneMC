@@ -184,11 +184,49 @@ Every line is printed in the layout a vanilla server's console uses, coloured on
 standard output and plain in `logs/latest.log`:
 
 ```
-[05:04:47] [Server thread/INFO]: LoadstoneMC 0.1.0 — Minecraft 1.21.11, protocol 774
-[05:04:47] [Server thread/INFO]: server.properties loaded path=./server.properties honoured=10 not_acted_on_yet=57
-[05:06:34] [Server thread/WARN]: You need to agree to the EULA in order to run the server. Go to eula.txt for more info.
-[05:06:39] [Server thread/ERROR]: failed to bind 127.0.0.1:25566: Address already in use (os error 98)
+[05:16:36] [Server thread/INFO]: LoadstoneMC 0.1.0 — Minecraft 1.21.11, protocol 774
+[05:16:36] [Server thread/INFO]: Starting minecraft server version 1.21.11
+[05:16:36] [Server thread/INFO]: Loading properties
+[05:16:36] [Server thread/INFO]: server.properties loaded path=./server.properties honoured=10 not_acted_on_yet=57
+[05:16:36] [Server thread/INFO]: Default game type: SURVIVAL
+[05:16:36] [Server thread/INFO]: Generating keypair
+[05:16:36] [Server thread/INFO]: Starting Minecraft server on *:25566
+[05:16:36] [Server thread/WARN]: **** SERVER IS RUNNING IN OFFLINE/INSECURE MODE!
+[05:16:36] [Server thread/INFO]: Preparing level "world"
+[05:16:36] [Server thread/INFO]: Loading 12 persistent chunks...
+[05:16:36] [Server thread/INFO]: world ready dir=./world seed=0 loaded_chunks=12
+[05:16:36] [Server thread/INFO]: spawned mobs mobs=7
+[05:16:36] [Server thread/INFO]: Time elapsed: 2 ms
+[05:16:36] [Server thread/INFO]: Done (0.043s)! For help, type "help"
 ```
+
+The start-up lines are **vanilla 1.21.11's own wording, in its order**, taken from
+a captured run of the real server rather than from documentation. Four are ours
+and have no vanilla equivalent (the banner, the properties summary, `world ready`
+and `spawned mobs`), and two vanilla lines are deliberately absent: this server
+selects no global world spawn and prepares no spawn area at start-up (chunks
+around spawn are generated on first join), so printing vanilla's
+`Selecting global world spawn...` and `Preparing spawn area: 100%` would be
+dressing up work that does not happen. Failures use vanilla's wording too, for
+the same reason an operator knows them: the EULA refusal, the offline-mode
+warnings, and
+
+```
+[Server thread/WARN]: **** FAILED TO BIND TO PORT!
+[Server thread/WARN]: The exception was: Address already in use (os error 98)
+[Server thread/WARN]: Perhaps a server is already running on that port?
+```
+
+The console accepts `stop` (also `exit`, `quit`, `shutdown`) and `help`, which is
+what the `Done (...)` line points at; anything else is answered with vanilla's
+
+```
+[Server thread/INFO]: Unknown or incomplete command. See below for error
+[Server thread/INFO]: <what was typed><--[HERE]
+```
+
+That `Done (...)` line is also what the Pterodactyl egg watches for, so the panel
+flips to "running" when the world is up rather than when the socket opens.
 
 The level is coloured by severity and the timestamp and any structured context
 after the message are dimmed, so the message itself is what stands out. Player
@@ -196,6 +234,10 @@ lines (join, leave, chat) additionally colour the text: `crates/loadstone-server
 exposes `component` and `style` fields for that. Context such as `honoured=10`
 is the structured logging the code already does, kept visible without drowning
 the message.
+
+Online mode generates its RSA keypair once at start-up (`Generating keypair`) and
+every login reuses it, the way vanilla does, which also keeps a 1024-bit key
+generation off the login path.
 
 `logs/latest.log` holds the same lines without escape codes, and the previous one
 is renamed to `latest.log.1` at startup rather than compressed, so it stays

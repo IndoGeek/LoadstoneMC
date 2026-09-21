@@ -16,7 +16,7 @@
     "startup": "./loadstone --bind 0.0.0.0:{{SERVER_PORT}} --max-players {{MAX_PLAYERS}} --online-mode={{ONLINE_MODE}} --save-interval {{SAVE_INTERVAL}} --colour always {{EXTRA_ARGS}}",
     "config": {
         "files": "{}",
-        "startup": "{\"done\": \"loadstone server listening on\"}",
+        "startup": "{\"done\": \"Done (\"}",
         "logs": "{}",
         "stop": "stop"
     },

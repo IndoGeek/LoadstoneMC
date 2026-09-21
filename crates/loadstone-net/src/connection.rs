@@ -79,6 +79,10 @@ pub struct ConnectionConfig {
     pub gamemode: i8,
     /// Whether the client is told the world is hardcore (`hardcore`).
     pub hardcore: bool,
+    /// The keypair every online-mode login uses. A server generates one at
+    /// startup, the way vanilla does; `None` makes each connection generate its
+    /// own, which is what tests and embedders want.
+    pub server_keys: Option<Arc<auth::ServerKeys>>,
     /// Base URL for Mojang session verification (used in online mode).
     pub sessionserver_url: String,
     /// The shared block world, edited live by every player.
@@ -105,6 +109,7 @@ impl Default for ConnectionConfig {
             compression_threshold: COMPRESSION_THRESHOLD,
             gamemode: 0,
             hardcore: false,
+            server_keys: None,
             sessionserver_url: "https://sessionserver.mojang.com/session/minecraft/hasJoined"
                 .to_string(),
             world: Arc::new(Mutex::new(world)),
@@ -368,8 +373,13 @@ async fn login_phase(
         return configuration_phase(conn, start.uuid, &username, config).await;
     }
 
-    // Online mode: encryption + Mojang session verification.
-    let keys = auth::generate_keys().map_err(NetError::Auth)?;
+    // Online mode: encryption + Mojang session verification. The keypair comes
+    // from the server when it has one, so a login does not pay for a 1024-bit key
+    // generation, and only falls back to making one here without it.
+    let keys = match &config.server_keys {
+        Some(keys) => keys.clone(),
+        None => Arc::new(auth::generate_keys().map_err(NetError::Auth)?),
+    };
     // Vanilla uses a four-byte challenge (`Ints.toByteArray(random.nextInt())`).
     let verify_token = auth::random_bytes::<4>();
 

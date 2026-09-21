@@ -52,6 +52,17 @@ pub fn gamemode_id(name: &str) -> Option<i8> {
     }
 }
 
+/// The name for a `gamemode` id, which is what the console's `Default game type`
+/// line prints (vanilla upper-cases it there).
+pub fn gamemode_name(id: i8) -> &'static str {
+    match id {
+        1 => "creative",
+        2 => "adventure",
+        3 => "spectator",
+        _ => "survival",
+    }
+}
+
 /// Vanilla `server.properties` for 1.21.11, in the order the file writes them.
 ///
 /// The order is the alphabetical one Java's `Properties.store` produces, which is
@@ -420,6 +431,11 @@ mod tests {
     /// missing, so a fresh install was not vanilla's key set at all.
     #[test]
     fn gamemode_names_map_to_the_ids_login_carries() {
+        for name in ["survival", "creative", "adventure", "spectator"] {
+            let id = gamemode_id(name).expect("a known gamemode");
+            assert_eq!(gamemode_name(id), name, "{name} did not round-trip");
+        }
+
         assert_eq!(gamemode_id("survival"), Some(0));
         assert_eq!(gamemode_id("creative"), Some(1));
         assert_eq!(gamemode_id("adventure"), Some(2));
