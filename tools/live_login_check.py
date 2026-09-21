@@ -174,9 +174,18 @@ def read_string(data: bytes, start: int = 0) -> tuple[str, int]:
 
 
 def server_id_hash(secret: bytes, public_key: bytes) -> str:
-    """Java's Crypt.digestData: SHA-1(secret ++ publicKey), dash after every byte."""
-    digest = hashlib.sha1(secret + public_key).hexdigest()
-    return "".join(f"{digest[i:i + 2]}-" for i in range(0, len(digest), 2))
+    """Java's `new BigInteger(sha1(secret ++ publicKey)).toString(16)`.
+
+    With an empty server id, which is what vanilla sends. The digest is read as a
+    *signed* big-endian integer, so a digest whose first bit is set is negative
+    to Java and prints as a two's-complement value with a leading `-`; leading
+    zero bytes are dropped. `int.from_bytes(..., signed=True)` plus `format(x)`
+    reproduces `BigInteger.toString(16)` exactly. The dash-separated form that
+    looks like a session id is the pre-1.7 format, which no client has ever sent
+    to a modern session server.
+    """
+    digest = hashlib.sha1(secret + public_key).digest()
+    return format(int.from_bytes(digest, "big", signed=True), "x")
 
 
 class Client:
@@ -823,19 +832,23 @@ def check_online_login(host: str, port: int, name: str, session: "MockSession") 
 
         check(server_id == "", "encryption request omits the legacy server id", server_id)
         check(should_authenticate, "encryption request asks the client to authenticate")
-        check(len(verify_token) == 16, "verify token is 16 bytes", str(len(verify_token)))
+        check(len(verify_token) == 4, "verify token is 4 bytes, like vanilla's", str(len(verify_token)))
 
         public = serialization.load_der_public_key(public_key)
         secret = os.urandom(16)
         encrypted_secret = public.encrypt(secret, padding.PKCS1v15())
+        # The token is echoed **encrypted**, the same way the session key is: a
+        # real client never returns it in the clear, so a server that accepts
+        # clear text would look fine here and reject every real login.
+        encrypted_token = public.encrypt(verify_token, padding.PKCS1v15())
         expected_server_id = server_id_hash(secret, public_key)
 
         client.write_packet(
             PKT_ENCRYPTION_RESPONSE,
             write_varint(len(encrypted_secret))
             + encrypted_secret
-            + write_varint(len(verify_token))
-            + verify_token,
+            + write_varint(len(encrypted_token))
+            + encrypted_token,
         )
         client.enable_encryption(secret)
 
@@ -884,13 +897,16 @@ def check_online_rejection(host: str, port: int, session: "MockSession") -> None
         public = serialization.load_der_public_key(public_key)
         secret = os.urandom(16)
         encrypted_secret = public.encrypt(secret, padding.PKCS1v15())
+        # Encrypted like a real client's, so this flow reaches the session check
+        # instead of being refused for a token it never echoed properly.
+        encrypted_token = public.encrypt(verify_token, padding.PKCS1v15())
 
         client.write_packet(
             PKT_ENCRYPTION_RESPONSE,
             write_varint(len(encrypted_secret))
             + encrypted_secret
-            + write_varint(len(verify_token))
-            + verify_token,
+            + write_varint(len(encrypted_token))
+            + encrypted_token,
         )
         client.enable_encryption(secret)
 
@@ -924,7 +940,8 @@ def check_online_token_mismatch(host: str, port: int) -> None:
         public = serialization.load_der_public_key(public_key)
         secret = os.urandom(16)
         encrypted_secret = public.encrypt(secret, padding.PKCS1v15())
-        bogus_token = bytes(16)
+        # Encrypted properly, but not the token the server sent.
+        bogus_token = public.encrypt(bytes(4), padding.PKCS1v15())
 
         client.write_packet(
             PKT_ENCRYPTION_RESPONSE,

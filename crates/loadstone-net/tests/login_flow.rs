@@ -665,9 +665,18 @@ async fn answer_encryption_request(client: &mut Client, token_override: Option<V
         .encrypt(&mut rand::thread_rng(), Pkcs1v15Encrypt, &shared_secret)
         .unwrap();
 
+    // The token is echoed **encrypted**, the same way the client encrypts the
+    // session key: a real client never sends the challenge back in the clear, and
+    // sending it in the clear is exactly the mistake that made an earlier version
+    // of this test pass against a server that could not login a real client.
+    let echoed_token = token_override.unwrap_or_else(|| request.verify_token.clone());
+    let encrypted_token = public_key
+        .encrypt(&mut rand::thread_rng(), Pkcs1v15Encrypt, &echoed_token)
+        .unwrap();
+
     let response = EncryptionResponse {
         shared_secret: encrypted_secret,
-        verify_token: token_override.unwrap_or_else(|| request.verify_token.clone()),
+        verify_token: encrypted_token,
     };
     let mut body = loadstone_protocol::PacketWriter::new();
     response.encode(&mut body);
@@ -1059,8 +1068,9 @@ async fn online_login_rejects_an_unpaired_verify_token() {
     client.handshake(2).await;
     client.login_start("MockPlayer").await;
 
-    // A well-formed key exchange, but the token from the request is not echoed back.
-    answer_encryption_request(&mut client, Some(vec![0u8; 16])).await;
+    // A well-formed key exchange, but the token from the request is not the one
+    // echoed back: a different value, encrypted just as properly.
+    answer_encryption_request(&mut client, Some(vec![0x42; 4])).await;
 
     let (id, body) = tokio::time::timeout(Duration::from_secs(5), client.recv_packet())
         .await

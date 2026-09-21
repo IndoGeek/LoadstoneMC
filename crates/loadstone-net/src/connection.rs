@@ -370,7 +370,8 @@ async fn login_phase(
 
     // Online mode: encryption + Mojang session verification.
     let keys = auth::generate_keys().map_err(NetError::Auth)?;
-    let verify_token = auth::random_bytes::<16>();
+    // Vanilla uses a four-byte challenge (`Ints.toByteArray(random.nextInt())`).
+    let verify_token = auth::random_bytes::<4>();
 
     let body = encode_body(&EncryptionRequest {
         server_id: String::new(),
@@ -391,7 +392,7 @@ async fn login_phase(
     }
     let response = EncryptionResponse::decode(&mut PacketReader::new(&frame.body))?;
     debug!("received encryption response, decrypting shared secret");
-    let secret = auth::decrypt_shared_secret(&keys.private, &response.shared_secret)
+    let secret = auth::decrypt_with_private_key(&keys.private, &response.shared_secret)
         .map_err(NetError::Auth)?;
     if secret.len() != 16 {
         return Err(NetError::InvalidSharedSecret(secret.len()));
@@ -403,7 +404,19 @@ async fn login_phase(
     // echo, so the echo is the whole check: profile-key signatures were dropped from
     // login in 1.19.3. A Mojang-signed key chain now arrives in the Play state as a
     // serverbound `chat_session_update`, which is where that verification belongs.
-    let token_echoed = response.verify_token == verify_token;
+    //
+    // The echo arrives RSA-encrypted with the key from the request, exactly like the
+    // shared secret, so it has to be decrypted before it can be compared. Comparing
+    // the ciphertext with the plaintext token rejects every real client, because no
+    // client ever sends the token back in the clear; a padding failure counts as a
+    // mismatch rather than an error, so a garbled echo gets the same refusal.
+    let token_echoed = match auth::decrypt_with_private_key(&keys.private, &response.verify_token) {
+        Ok(echoed) => echoed == verify_token,
+        Err(error) => {
+            debug!(%error, "the verify token echo did not decrypt");
+            false
+        }
+    };
 
     conn = conn.enable_encryption(secret_bytes)?;
     debug!("AES/CFB8 encryption enabled on the connection");

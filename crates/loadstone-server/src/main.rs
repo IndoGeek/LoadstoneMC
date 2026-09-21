@@ -2,16 +2,29 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Context;
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use loadstone_net::{run_connection, tick_entities, ConnectionConfig};
 use loadstone_protocol::{MINECRAFT_VERSION, PROTOCOL_VERSION};
 use loadstone_world::{world, EntityStore, World};
 use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 
+mod logging;
 mod properties;
 
 use properties::ServerProperties;
+
+/// When to colour the console.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ColourMode {
+    /// Only when standard output is a terminal.
+    Auto,
+    /// Always. A panel renders escape codes but has no terminal of its own, so
+    /// this is what it wants.
+    Always,
+    /// Never, for a log shipper that would rather have plain text.
+    Never,
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "loadstone", version, about)]
@@ -65,20 +78,45 @@ struct Args {
     /// Seconds between automatic saves of dirty chunks (0 disables).
     #[arg(long, default_value_t = 30)]
     save_interval: u64,
-}
 
+    /// Colour the console output. `logs/latest.log` is never coloured.
+    #[arg(long, value_enum, default_value_t = ColourMode::Auto)]
+    colour: ColourMode,
+}
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("loadstone=debug,info"));
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(false)
-        .init();
-
     let args = Args::parse();
     let dir = args.dir.clone();
     std::fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
+
+    // Logging comes up before anything else so a failed start is on the record
+    // too, in the layout vanilla's console uses: `[HH:MM:SS] [Server
+    // thread/LEVEL]: message`, coloured on the console and plain in the file.
+    let logs_dir = dir.join("logs");
+    let (log_file, log_error) = match logging::open_log_file(&logs_dir) {
+        Ok(file) => (file, None),
+        Err(error) => (logging::LogFile::sink(), Some(error)),
+    };
+    let ansi = match args.colour {
+        ColourMode::Always => true,
+        ColourMode::Never => false,
+        ColourMode::Auto => std::io::IsTerminal::is_terminal(&std::io::stdout()),
+    };
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("loadstone=debug,info"));
+    let log_file = logging::init(log_file, ansi, filter);
+
+    if let Some(error) = log_error {
+        warn!("could not open logs/latest.log ({error}); logging to the console only");
+    }
+
+    info!(
+        style = "banner",
+        "LoadstoneMC {} \u{2014} Minecraft {}, protocol {}",
+        env!("CARGO_PKG_VERSION"),
+        MINECRAFT_VERSION,
+        PROTOCOL_VERSION
+    );
 
     // `server.properties` is the source of truth and the flags only override it
     // when they are given, which is how vanilla's own flags behave. The file is
@@ -102,11 +140,14 @@ async fn main() -> anyhow::Result<()> {
             .with_context(|| format!("failed to write {}", eula_path.display()))?;
         info!(path = %eula_path.display(), "accepted the Minecraft EULA");
     } else if !eula_accepted(&eula_path) {
-        anyhow::bail!(
-            "the Minecraft EULA (https://aka.ms/MinecraftEULA) has not been accepted; \
-             start once with --accept-eula, or set eula=true in {}",
+        // Vanilla's own wording for this refusal, then what to do about it here.
+        warn!("You need to agree to the EULA in order to run the server. Go to eula.txt for more info.");
+        warn!(
+            "Start once with --accept-eula to write {} for you.",
             eula_path.display()
         );
+        log_file.flush();
+        std::process::exit(1);
     }
 
     let ignored = props.unhonoured_keys();
@@ -185,9 +226,14 @@ async fn main() -> anyhow::Result<()> {
     };
     let world_handle = net_config.world.clone();
 
-    let listener = TcpListener::bind(&bind)
-        .await
-        .with_context(|| format!("failed to bind {bind}"))?;
+    let listener = match TcpListener::bind(&bind).await {
+        Ok(listener) => listener,
+        Err(error) => {
+            error!("failed to bind {bind}: {error}");
+            log_file.flush();
+            std::process::exit(1);
+        }
+    };
     info!(
         version = MINECRAFT_VERSION,
         protocol = PROTOCOL_VERSION,
@@ -229,6 +275,10 @@ async fn main() -> anyhow::Result<()> {
     }
 
     save_world(&world_handle, &world_dir, true);
+    info!("stopping the server");
+    // Flush the file layer so the closing lines are on disk even if the process
+    // is killed immediately after this returns.
+    log_file.flush();
     Ok(())
 }
 
@@ -236,8 +286,34 @@ async fn main() -> anyhow::Result<()> {
 /// `stop`/`exit`/`quit` is typed on stdin (which is how Pterodactyl asks a
 /// server to stop). Reaching end-of-file on stdin is not a shutdown signal, so
 /// the server keeps running when it has no controlling terminal.
+///
+/// The console is read on a plain OS thread rather than through
+/// `tokio::io::stdin`. That route parks the read in the runtime's blocking pool,
+/// and dropping the runtime waits for blocking tasks to finish; an idle terminal
+/// never returns the read, so the process would run the whole shutdown, save the
+/// world, stop listening and then hang forever instead of exiting. A detached
+/// thread is abandoned at exit like any other, so it cannot do that.
 async fn shutdown_signal() {
-    use tokio::io::AsyncBufReadExt as _;
+    let (stop_tx, mut stop_rx) = tokio::sync::mpsc::channel::<()>(1);
+    std::thread::spawn(move || {
+        use std::io::BufRead as _;
+
+        let stdin = std::io::stdin();
+        for line in stdin.lock().lines() {
+            match line {
+                Ok(line) => {
+                    let command = line.trim().to_ascii_lowercase();
+                    if matches!(command.as_str(), "stop" | "exit" | "quit" | "shutdown") {
+                        let _ = stop_tx.blocking_send(());
+                        return;
+                    }
+                }
+                // EOF or a read error means no console is attached: stop reading
+                // rather than treating it as a stop request.
+                Err(_) => return,
+            }
+        }
+    });
 
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;
@@ -255,20 +331,12 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     let terminate = std::future::pending::<()>();
 
-    let stdin_stop = async {
-        let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
-        loop {
-            match lines.next_line().await {
-                Ok(Some(line)) => {
-                    let command = line.trim().to_ascii_lowercase();
-                    if matches!(command.as_str(), "stop" | "exit" | "quit" | "shutdown") {
-                        break;
-                    }
-                }
-                // EOF or a read error means no console is attached: wait forever
-                // rather than interpreting it as a stop request.
-                Ok(None) | Err(_) => std::future::pending::<()>().await,
-            }
+    let stdin_stop = async move {
+        match stop_rx.recv().await {
+            Some(()) => {}
+            // The console thread ended without a command (no console at all), so
+            // this future never completes and the server keeps running.
+            None => std::future::pending::<()>().await,
         }
     };
 

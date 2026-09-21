@@ -19,3 +19,5 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
 clap = { version = "4", features = ["derive"] }
+# Local wall-clock timestamps for the console, the way vanilla prints them.
+chrono.workspace = true

@@ -138,6 +138,7 @@ decides.
 | `--world` | `level-name`, under `--dir` | World directory holding `region/` and the seed sidecar |
 | `--seed` | saved seed, else `0` | Terrain seed for a new world |
 | `--save-interval` | `30` | Seconds between autosaves of dirty chunks (`0` disables) |
+| `--colour` | `auto` | Colour the console: `auto` (only on a terminal), `always`, `never` |
 
 ### Configuration
 
@@ -177,7 +178,38 @@ Pterodactyl stops it). World files are vanilla-compatible Anvil regions
 (`DataVersion 4671`), so an existing vanilla 1.21.11 world can be dropped in and
 edited.
 
-Logging is controlled by `RUST_LOG` (for example `RUST_LOG=loadstone=debug`).
+### Console and logging
+
+Every line is printed in the layout a vanilla server's console uses, coloured on
+standard output and plain in `logs/latest.log`:
+
+```
+[05:04:47] [Server thread/INFO]: LoadstoneMC 0.1.0 — Minecraft 1.21.11, protocol 774
+[05:04:47] [Server thread/INFO]: server.properties loaded path=./server.properties honoured=10 not_acted_on_yet=57
+[05:06:34] [Server thread/WARN]: You need to agree to the EULA in order to run the server. Go to eula.txt for more info.
+[05:06:39] [Server thread/ERROR]: failed to bind 127.0.0.1:25566: Address already in use (os error 98)
+```
+
+The level is coloured by severity and the timestamp and any structured context
+after the message are dimmed, so the message itself is what stands out. Player
+lines (join, leave, chat) additionally colour the text: `crates/loadstone-server/src/logging.rs`
+exposes `component` and `style` fields for that. Context such as `honoured=10`
+is the structured logging the code already does, kept visible without drowning
+the message.
+
+`logs/latest.log` holds the same lines without escape codes, and the previous one
+is renamed to `latest.log.1` at startup rather than compressed, so it stays
+greppable. Console colour follows the terminal by default; a panel has no
+terminal of its own but renders escape codes, which is why the Pterodactyl egg
+passes `--colour always`. Verbosity is set with `RUST_LOG` (for example
+`RUST_LOG=loadstone=debug`).
+
+The server stops on Ctrl-C/SIGINT, on `SIGTERM`, or on `stop`/`exit`/`quit` typed
+at the console, then saves the world and flushes the log. Console input is read on
+its own OS thread, not through the async runtime: a blocking read parked in the
+runtime's blocking pool is never woken by an idle terminal, and dropping the
+runtime would wait for it forever, so the process would finish its whole shutdown
+and then hang instead of exiting.
 
 ## Layout
 
@@ -286,6 +318,19 @@ is non-zero if anything fails, so it can gate a release.
   signature field (profile-key signatures left login in 1.19.3). Mojang-signed
   key chains arrive later, in the Play state as a serverbound
   `chat_session_update`, and that is where signature verification belongs.
+- **The echoed verify token is RSA-encrypted, like the shared secret**, so the
+  echo is decrypted with the server's private key before it is compared. A
+  comparison against the bytes as received can only ever match a client that
+  wrongly sends the token in the clear, which is what makes this bug easy to
+  write and hard to notice: a test client that mirrors the server will pass.
+- **The `serverId` hash is Java's signed `BigInteger` hex.** With vanilla's empty
+  server id it is `SHA-1(sharedSecret ++ publicKey)` read as a *signed* big-endian
+  integer, so a digest whose first bit is set prints with a leading `-` and a
+two's-complement magnitude, and leading zero bytes are dropped. Hex-dumping the
+  digest (or joining it with `-` like the pre-1.7 session id) produces a string
+  the client never sent, and Mojang answers it with 204, which surfaces as a
+  login failure long after the key exchange looked fine. `auth.rs` pins this to
+  values produced by Java's `new BigInteger(...).toString(16)` itself.
 - Compression is enabled at a 256-byte threshold, matching the vanilla default,
   and `network-compression-threshold` moves or disables it: a negative value
   suppresses the Set Compression packet and leaves the stream uncompressed.
