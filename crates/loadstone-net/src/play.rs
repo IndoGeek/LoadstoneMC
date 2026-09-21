@@ -341,6 +341,8 @@ async fn run_play(
     conn.write_packet(SystemChat::ID, &body).await?;
 
     info!(name = %username, entity_id, "player entered the world");
+    // Vanilla's line, and the one a player's "did I get in?" is answered by.
+    info!("{username} joined the game");
     play_loop(
         &mut conn,
         uuid,
@@ -444,7 +446,8 @@ fn broadcast_join(
 /// Removes a player from the registry and tells everyone else they left.
 fn leave_world(config: &ConnectionConfig, uuid: Uuid, entity_id: i32) {
     let mut state = config.state.lock().unwrap();
-    state.players.remove(&uuid);
+    // Taken before the removal, since the name goes with it.
+    let name = state.players.remove(&uuid).map(|player| player.name);
 
     let remove_tab = encode_body(&PlayerRemove {
         players: vec![uuid],
@@ -455,6 +458,11 @@ fn leave_world(config: &ConnectionConfig, uuid: Uuid, entity_id: i32) {
     for player in state.players.values() {
         let _ = player.out.send((PlayerRemove::ID, remove_tab.clone()));
         let _ = player.out.send((RemoveEntities::ID, remove_entity.clone()));
+    }
+    drop(state);
+
+    if let Some(name) = name {
+        info!("{name} left the game");
     }
 }
 
