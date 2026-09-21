@@ -117,10 +117,29 @@ fn java_hex(bytes: &[u8]) -> String {
     hex
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionProfile {
     pub uuid: Uuid,
     pub name: String,
+}
+
+/// What the session server actually said.
+///
+/// "The account was refused" and "the question never reached Mojang" used to
+/// collapse into the same `None`, which left an operator unable to tell a player
+/// whose session was stale from one whose login failed because the network was
+/// down. Only the first of those is about the player, so only the first should
+/// read like a verdict.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionOutcome {
+    /// The account is real and joined with this key exchange.
+    Verified(SessionProfile),
+    /// Mojang answered, and the answer is no: no session joined with this key
+    /// exchange, so the client is not who it claims to be.
+    Rejected,
+    /// The session server could not be reached, or answered with something that
+    /// is not a verdict. Nothing was proven either way.
+    Unavailable(String),
 }
 
 #[derive(serde::Deserialize)]
@@ -129,32 +148,63 @@ struct SessionResponse {
     name: String,
 }
 
-/// Query Mojang's `hasJoined` endpoint (or a mock) to prove the client owns
-/// its username. Returns `None` if auth failed (bad key exchange, offline
-/// attacker, or a cracked client).
+/// Ask Mojang's `hasJoined` endpoint (or a mock) whether the client owns its
+/// username.
 pub async fn check_session(
     sessionserver_url: &str,
     username: &str,
     server_id: &str,
-) -> Option<SessionProfile> {
+) -> SessionOutcome {
     let url = format!("{sessionserver_url}?username={username}&serverId={server_id}");
-    tokio::task::spawn_blocking(move || {
-        let body = ureq::get(&url)
-            .timeout(Duration::from_secs(8))
-            .call()
-            .ok()?
-            .into_string()
-            .ok()?;
-        let response: SessionResponse = serde_json::from_str(&body).ok()?;
-        let uuid = Uuid::parse_str(&response.id).ok()?;
-        Some(SessionProfile {
-            uuid,
-            name: response.name,
-        })
+    let answered = tokio::task::spawn_blocking(move || {
+        match ureq::get(&url).timeout(Duration::from_secs(8)).call() {
+            Ok(response) => {
+                let status = response.status();
+                let body = response.into_string().unwrap_or_default();
+                classify_session_response(status, &body)
+            }
+            // ureq reports a 4xx/5xx as an error carrying the status.
+            Err(ureq::Error::Status(status, response)) => {
+                classify_session_response(status, &response.into_string().unwrap_or_default())
+            }
+            Err(ureq::Error::Transport(error)) => SessionOutcome::Unavailable(error.to_string()),
+        }
     })
-    .await
-    .ok()
-    .flatten()
+    .await;
+
+    match answered {
+        Ok(outcome) => outcome,
+        Err(error) => SessionOutcome::Unavailable(format!("session check task failed: {error}")),
+    }
+}
+
+/// Turn one `hasJoined` response into an outcome.
+///
+/// Minecraft answers `204 No Content` for a username that did not join with this
+/// key exchange: that is a verdict about the player. A 5xx, or a 200 whose body
+/// cannot be read as a profile, is a problem on the way to the answer instead.
+fn classify_session_response(status: u16, body: &str) -> SessionOutcome {
+    match status {
+        204 | 404 => SessionOutcome::Rejected,
+        // A 200 with nothing in it is the same answer as a 204: no session.
+        // Mojang sends 204, but a session server in front of it may not.
+        200 if body.trim().is_empty() => SessionOutcome::Rejected,
+        200 => match serde_json::from_str::<SessionResponse>(body) {
+            Ok(response) => match Uuid::parse_str(&response.id) {
+                Ok(uuid) => SessionOutcome::Verified(SessionProfile {
+                    uuid,
+                    name: response.name,
+                }),
+                Err(error) => SessionOutcome::Unavailable(format!(
+                    "session server sent an unreadable uuid: {error}"
+                )),
+            },
+            Err(error) => SessionOutcome::Unavailable(format!(
+                "session server sent an unreadable body: {error}"
+            )),
+        },
+        other => SessionOutcome::Unavailable(format!("session server answered HTTP {other}")),
+    }
 }
 
 pub fn random_bytes<const N: usize>() -> [u8; N] {
@@ -179,6 +229,49 @@ mod tests {
         let mut key = vec![0x30, 0x82, 0x01];
         key.extend([b'k'; 40]);
         key
+    }
+
+    #[test]
+    fn a_no_content_answer_is_a_verdict_about_the_player() {
+        assert_eq!(classify_session_response(204, ""), SessionOutcome::Rejected);
+        assert_eq!(classify_session_response(404, ""), SessionOutcome::Rejected);
+        // The shape a session server that answers 200 instead of 204 uses.
+        assert_eq!(classify_session_response(200, ""), SessionOutcome::Rejected);
+    }
+
+    #[test]
+    fn a_working_session_server_yields_the_profile() {
+        let body = r#"{"id":"069a79f4-44e9-4726-a5be-fca90e38aaf5","name":"Notch"}"#;
+        assert_eq!(
+            classify_session_response(200, body),
+            SessionOutcome::Verified(SessionProfile {
+                uuid: Uuid::parse_str("069a79f4-44e9-4726-a5be-fca90e38aaf5").unwrap(),
+                name: "Notch".to_string(),
+            })
+        );
+    }
+
+    /// These are not verdicts about the player, so they must not be reported as
+    /// one: an operator seeing "failed to verify username" should mean Mojang was
+    /// asked and said no.
+    #[test]
+    fn server_side_trouble_is_not_a_rejection() {
+        assert!(matches!(
+            classify_session_response(500, ""),
+            SessionOutcome::Unavailable(_)
+        ));
+        assert!(matches!(
+            classify_session_response(429, "too many requests"),
+            SessionOutcome::Unavailable(_)
+        ));
+        assert!(matches!(
+            classify_session_response(200, "<html>maintenance</html>"),
+            SessionOutcome::Unavailable(_)
+        ));
+        assert!(matches!(
+            classify_session_response(200, r#"{"id":"not-a-uuid","name":"Notch"}"#),
+            SessionOutcome::Unavailable(_)
+        ));
     }
 
     #[test]

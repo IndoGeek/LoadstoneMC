@@ -26,7 +26,7 @@ use loadstone_protocol::packets::status::{
 use loadstone_protocol::{Packet, PacketReader, PacketWriter, PROTOCOL_VERSION};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::auth;
 use crate::codec::{read_frame, write_frame, FrameError, InboundFrame};
@@ -446,15 +446,36 @@ async fn login_phase(
 
     // Prove to Mojang that the client holds its session key.
     let server_id = auth::compute_server_id(&secret_bytes, &keys.public_der);
-    let profile =
-        match auth::check_session(&config.sessionserver_url, &start.name, &server_id).await {
-            Some(profile) => profile,
-            None => {
-                warn!(name = %start.name, "failed to verify username");
-                send_disconnect(&mut conn, "Failed to verify username!".to_string()).await?;
-                return Ok(());
-            }
-        };
+    let profile = match auth::check_session(&config.sessionserver_url, &start.name, &server_id)
+        .await
+    {
+        auth::SessionOutcome::Verified(profile) => profile,
+        // Mojang was asked and said no. This is the exact component vanilla sends,
+        // captured from a real 1.21.11 server, so a client shows its own language's
+        // wording instead of a hard-coded English sentence.
+        auth::SessionOutcome::Rejected => {
+            warn!(name = %start.name, "failed to verify username: no session joined with this key exchange");
+            send_disconnect_component(
+                &mut conn,
+                r#"{"translate":"multiplayer.disconnect.unverified_username"}"#.to_string(),
+            )
+            .await?;
+            return Ok(());
+        }
+        // The question never reached Mojang, so nothing was proven. Saying
+        // "failed to verify username" here would blame the player for a network
+        // problem, so the console gets the reason and the client is told to try
+        // again rather than told it is not who it says it is.
+        auth::SessionOutcome::Unavailable(reason) => {
+            error!(name = %start.name, %reason, "could not check the session server");
+            send_disconnect(
+                &mut conn,
+                "Failed to verify username! The session server could not be reached.".to_string(),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
     info!(name = %profile.name, uuid = %profile.uuid, mode = "online", "login complete");
 
     let username = profile.name.clone();
@@ -654,6 +675,18 @@ fn encode_brand(brand: &str) -> Vec<u8> {
 
 async fn send_disconnect(conn: &mut Connection, message: String) -> Result<(), NetError> {
     let reason_json = serde_json::to_string(&MessageText { text: message })?;
+    send_disconnect_component(conn, reason_json).await
+}
+
+/// Disconnect with a reason that is already a JSON text component.
+///
+/// The login reason field is a component, so a translatable one has to go out
+/// untouched: wrapping vanilla's `{"translate":...}` in `{"text":...}` would hand
+/// the client the JSON as the sentence to display.
+async fn send_disconnect_component(
+    conn: &mut Connection,
+    reason_json: String,
+) -> Result<(), NetError> {
     let body = encode_body(&LoginDisconnect {
         reason: reason_json,
     });

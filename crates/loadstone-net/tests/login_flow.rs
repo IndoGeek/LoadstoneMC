@@ -586,14 +586,18 @@ async fn spawn_mock_sessionserver(
                 username = Some(value.to_string());
             }
         }
-        let body = match username.as_deref() {
-            Some("MockPlayer") => {
-                format!(r#"{{"id":"{MOCK_PLAYER_ID}","name":"MockPlayer","properties":[]}}"#)
-            }
-            _ => String::new(),
+        // 204 No Content for an account that never joined, which is what Mojang
+        // answers; a mock that always says 200 would hide the distinction between
+        // "Mojang said no" and "the request never got an answer".
+        let (status, body) = match username.as_deref() {
+            Some("MockPlayer") => (
+                "200 OK",
+                format!(r#"{{"id":"{MOCK_PLAYER_ID}","name":"MockPlayer","properties":[]}}"#),
+            ),
+            _ => ("204 No Content", String::new()),
         };
         let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
             body.len(),
             body
         );
@@ -1040,9 +1044,10 @@ async fn online_login_rejects_unverified_username() {
     assert_eq!(id, loadstone_protocol::packets::login::LoginDisconnect::ID);
     let mut reader = PacketReader::new(&body);
     let reason = reader.read_string().unwrap().to_string();
-    assert!(
-        reason.contains("Failed to verify username"),
-        "got: {reason}"
+    // Vanilla's exact component, so the client renders its own language.
+    assert_eq!(
+        reason,
+        r#"{"translate":"multiplayer.disconnect.unverified_username"}"#
     );
 
     tokio::time::timeout(Duration::from_secs(5), server)
@@ -1166,6 +1171,41 @@ async fn status_can_be_turned_off() {
         ),
         Ok(n) => panic!("the server answered a disabled status ping with {n} bytes"),
     }
+
+    server.abort();
+}
+
+/// "Mojang said no" and "Mojang could not be asked" are different facts, and only
+/// the first is about the player. An unreachable session server must not read as a
+/// rejected login, or the operator has no way to tell a cracked client from a
+/// network problem.
+#[tokio::test]
+async fn an_unreachable_session_server_is_not_a_rejected_login() {
+    let mut config = base_config(true);
+    // Nothing is listening on port 1: the request fails on the way out.
+    config.sessionserver_url = "http://127.0.0.1:1/session/minecraft/hasJoined".to_string();
+    let (addr, server) = spawn_server(config).await;
+
+    let mut client = Client::connect(&addr).await;
+    client.handshake(2).await;
+    client.login_start("MockPlayer").await;
+    answer_encryption_request(&mut client, None).await;
+
+    let (id, body) = client.recv_timed().await;
+    assert_eq!(
+        id,
+        loadstone_protocol::packets::login::LoginDisconnect::ID,
+        "the client is still told the login failed"
+    );
+    let reason = PacketReader::new(&body).read_string().unwrap().to_string();
+    assert!(
+        reason.contains("could not be reached"),
+        "the reason must name the unreachable session server, got: {reason}"
+    );
+    assert_ne!(
+        reason, "multiplayer.disconnect.unverified_username",
+        "an unreachable session server is not a verdict about the player"
+    );
 
     server.abort();
 }

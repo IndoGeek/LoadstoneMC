@@ -915,7 +915,10 @@ def check_online_rejection(host: str, port: int, session: "MockSession") -> None
                      "an unverified account is disconnected", f"id {packet_id:#04x}"):
             return
         reason, _ = read_string(body)
-        check("Failed to verify username" in reason, "the disconnect explains the reason", reason)
+        # Vanilla's own component, captured from a real 1.21.11 server, so the
+        # client renders the refusal in its own language.
+        check("multiplayer.disconnect.unverified_username" in reason,
+              "the disconnect names vanilla's unverified-username reason", reason)
     finally:
         client.close()
 
