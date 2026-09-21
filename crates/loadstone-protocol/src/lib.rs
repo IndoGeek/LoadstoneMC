@@ -1,3 +1,4 @@
+pub mod chunk;
 mod error;
 mod nbt;
 mod packet;

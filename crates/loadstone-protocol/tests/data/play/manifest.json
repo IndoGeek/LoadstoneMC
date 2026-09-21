@@ -1,0 +1,14 @@
+{
+ "minecraft_version": "1.21.11",
+ "protocol": 774,
+ "source": "captured from a vanilla server, offline mode, flat world",
+ "fixtures": {
+  "login": 112,
+  "position": 61,
+  "spawn_position": 36,
+  "game_state_change": 5,
+  "update_view_position": 2,
+  "chunk_batch_start": 0,
+  "map_chunk": 7233
+ }
+}
