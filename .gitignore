@@ -7,3 +7,15 @@ data/*.jar
 data/*.json
 !data/.gitkeep
 .freebuff
+
+# Python bytecode from the tools/ scripts. One of these was committed by
+# accident; `git rm -r --cached tools/__pycache__` is what takes it back out.
+__pycache__/
+*.pyc
+
+# What running a server from a checkout leaves behind. `world/` is above, the
+# rest are the other files a server in the repository root drops here.
+/server.properties
+/eula.txt
+/logs/
+/cache/
