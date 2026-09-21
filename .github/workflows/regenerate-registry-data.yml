@@ -1,0 +1,56 @@
+name: Regenerate registry data
+
+# Capturing the registries means running the real vanilla server, which needs
+# Java and downloads the server jar, so this never runs on its own. Use it when
+# the target Minecraft version changes: it re-captures for the version the
+# protocol crate speaks and fails if the committed files no longer match, which
+# is how staleness gets detected instead of remembered.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Minecraft version to capture
+        required: true
+        default: "1.21.11"
+      protocol:
+        description: Protocol number for the handshake
+        required: true
+        default: "774"
+
+jobs:
+  capture:
+    name: capture from the vanilla server
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Capture from the vanilla server
+        run: |
+          python3 tools/capture_vanilla_registries.py \
+            --version "${{ inputs.version }}" \
+            --protocol "${{ inputs.protocol }}"
+
+      - name: Report what changed
+        if: always()
+        run: git --no-pager diff --stat -- crates/loadstone-registry/data
+
+      # Green means the committed data still matches vanilla; red means it was
+      # stale and the diff below is what needs committing.
+      - name: Fail if the committed data was stale
+        run: git diff --exit-code -- crates/loadstone-registry/data
+
+      - name: Upload the regenerated data
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: registry-data
+          path: crates/loadstone-registry/data

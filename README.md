@@ -207,6 +207,12 @@ cargo clippy --workspace --all-targets       # must stay silent
 cargo fmt --all --check
 ```
 
+`.github/workflows/ci.yml` enforces exactly those three (clippy with
+`-D warnings`) and then runs `tools/live_login_check.py` in both modes against
+the release binary. `regenerate-registry-data.yml` is a manual job that
+re-captures the registry data from a real vanilla server when the target version
+changes, so staleness fails a build instead of going unnoticed.
+
 `crates/loadstone-net/tests/login_flow.rs` starts a real listener and drives the
 whole login handshake through Configuration and into the Play state, including
 online mode against a local mock session server, so no Mojang account or network

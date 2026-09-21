@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: fmt, clippy, tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Formatting
+        run: cargo fmt --all --check
+
+      # The workspace is expected to be warning-free; treat one as a failure.
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      # Includes the test that fails if the captured registry data no longer
+      # matches the version in loadstone-protocol.
+      - name: Tests
+        run: cargo test --workspace --locked
+
+  live-checks:
+    name: live protocol checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # The independent client encrypts its own traffic, so online mode needs
+      # real AES/CFB8 rather than a stand-in.
+      - name: Install cryptography
+        run: pip install cryptography
+
+      - name: Build the server
+        run: cargo build --release --locked
+
+      # Both modes spawn the binary and drive it over a socket, all the way
+      # through Configuration, against a mock session server (no Mojang access).
+      - name: Offline login and configuration
+        run: python3 tools/live_login_check.py
+
+      - name: Online login and configuration
+        run: python3 tools/live_login_check.py --mode online
