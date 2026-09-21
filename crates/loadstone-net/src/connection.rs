@@ -69,6 +69,16 @@ pub struct ConnectionConfig {
     /// When `false`, login is offline-mode: no encryption, no session check,
     /// any provided profile is accepted.
     pub online_mode: bool,
+    /// Whether server-list pings are answered at all (`enable-status`).
+    pub enable_status: bool,
+    /// The zlib threshold advertised in Set Compression. `-1` skips both the
+    /// packet and the codec switch, so `network-compression-threshold` is the
+    /// only place the decision lives.
+    pub compression_threshold: i32,
+    /// The game mode the login packet reports (`gamemode`); 0 is survival.
+    pub gamemode: i8,
+    /// Whether the client is told the world is hardcore (`hardcore`).
+    pub hardcore: bool,
     /// Base URL for Mojang session verification (used in online mode).
     pub sessionserver_url: String,
     /// The shared block world, edited live by every player.
@@ -91,6 +101,10 @@ impl Default for ConnectionConfig {
             max_players: 20,
             online_players: 0,
             online_mode: false,
+            enable_status: true,
+            compression_threshold: COMPRESSION_THRESHOLD,
+            gamemode: 0,
+            hardcore: false,
             sessionserver_url: "https://sessionserver.mojang.com/session/minecraft/hasJoined"
                 .to_string(),
             world: Arc::new(Mutex::new(world)),
@@ -257,6 +271,14 @@ pub async fn run_connection(stream: TcpStream, config: ConnectionConfig) -> Resu
 }
 
 async fn status_phase(conn: &mut Connection, config: &ConnectionConfig) -> Result<(), NetError> {
+    // `enable-status=false` means the ping is not answered at all: vanilla drops
+    // the connection without reading the request, so there is nothing to reply
+    // to and no status to build.
+    if !config.enable_status {
+        debug!("status disabled by enable-status; closing the connection");
+        return Ok(());
+    }
+
     let frame = conn.read_packet().await?;
     if frame.id != StatusRequest::ID {
         return Err(NetError::Protocol(
@@ -342,7 +364,7 @@ async fn login_phase(
     if !config.online_mode {
         info!(name = %start.name, mode = "offline", "login complete");
         let username = start.name.clone();
-        let conn = finish_login(conn, start.uuid, start.name).await?;
+        let conn = finish_login(conn, start.uuid, start.name, config).await?;
         return configuration_phase(conn, start.uuid, &username, config).await;
     }
 
@@ -413,7 +435,7 @@ async fn login_phase(
     info!(name = %profile.name, uuid = %profile.uuid, mode = "online", "login complete");
 
     let username = profile.name.clone();
-    let conn = finish_login(conn, profile.uuid, profile.name).await?;
+    let conn = finish_login(conn, profile.uuid, profile.name, config).await?;
     configuration_phase(conn, profile.uuid, &username, config).await
 }
 
@@ -421,13 +443,19 @@ async fn finish_login(
     mut conn: Connection,
     uuid: uuid::Uuid,
     username: String,
+    config: &ConnectionConfig,
 ) -> Result<Connection, NetError> {
-    // Enable zlib compression before Login Success.
-    let body = encode_body(&SetCompression {
-        threshold: COMPRESSION_THRESHOLD,
-    });
-    conn.write_packet(SetCompression::ID, &body).await?;
-    conn.set_compression(COMPRESSION_THRESHOLD);
+    // Enable zlib compression before Login Success. A negative threshold is
+    // vanilla's "off": the packet is not sent and frames stay uncompressed.
+    if config.compression_threshold >= 0 {
+        let body = encode_body(&SetCompression {
+            threshold: config.compression_threshold,
+        });
+        conn.write_packet(SetCompression::ID, &body).await?;
+        conn.set_compression(config.compression_threshold);
+    } else {
+        debug!("network-compression-threshold is negative; not compressing");
+    }
 
     let body = encode_body(&LoginSuccess {
         uuid,

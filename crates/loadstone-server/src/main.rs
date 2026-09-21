@@ -9,32 +9,42 @@ use loadstone_world::{world, EntityStore, World};
 use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 
+mod properties;
+
+use properties::ServerProperties;
+
 #[derive(Debug, Parser)]
 #[command(name = "loadstone", version, about)]
 struct Args {
-    /// Address to bind (host:port).
-    #[arg(long, default_value = "0.0.0.0:25565")]
-    bind: String,
+    /// Directory holding `server.properties`, `eula.txt` and the world.
+    #[arg(long, default_value = ".")]
+    dir: PathBuf,
+
+    /// Accept the Minecraft EULA, writing `eula.txt`. A server that has not
+    /// accepted it refuses to start, the way vanilla does.
+    #[arg(long)]
+    accept_eula: bool,
+
+    /// Address to bind (host:port). Defaults to `server-ip`:`server-port` from
+    /// `server.properties`.
+    #[arg(long)]
+    bind: Option<String>,
 
     /// Server list MOTD. Defaults to the `MOTD` environment variable (the
-    /// convention Pterodactyl uses) or "A LoadstoneMC server".
+    /// convention Pterodactyl uses), then `motd` in `server.properties`.
     #[arg(long)]
     motd: Option<String>,
 
-    /// Maximum number of players shown in the server list.
-    #[arg(long, default_value_t = 20)]
-    max_players: i32,
+    /// Maximum number of players. Defaults to `max-players`.
+    #[arg(long)]
+    max_players: Option<i32>,
 
     /// Require encryption and verify accounts against Mojang's session server.
-    /// Accepts a bare flag or an explicit `--online-mode=true|false` so a
-    /// process manager can pass the value from a variable.
-    #[arg(
-        long,
-        default_value_t = false,
-        num_args = 0..=1,
-        default_missing_value = "true"
-    )]
-    online_mode: bool,
+    /// Defaults to `online-mode`. Accepts a bare flag or an explicit
+    /// `--online-mode=true|false` so a process manager can pass the value from a
+    /// variable.
+    #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+    online_mode: Option<bool>,
 
     /// Base URL used for Mojang-style session verification (`hasJoined`).
     #[arg(
@@ -43,9 +53,10 @@ struct Args {
     )]
     sessionserver_url: String,
 
-    /// World directory holding `region/` and the seed sidecar.
-    #[arg(long, default_value = "world")]
-    world: PathBuf,
+    /// World directory holding `region/` and the seed sidecar. Defaults to
+    /// `level-name` under [`Args::dir`].
+    #[arg(long)]
+    world: Option<PathBuf>,
 
     /// Terrain seed. Defaults to the saved seed, or 0 for a new world.
     #[arg(long)]
@@ -66,11 +77,78 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let args = Args::parse();
+    let dir = args.dir.clone();
+    std::fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
+
+    // `server.properties` is the source of truth and the flags only override it
+    // when they are given, which is how vanilla's own flags behave. The file is
+    // written back on every start so keys a future version adds appear without
+    // the operator having to know they exist.
+    let props_path = dir.join("server.properties");
+    let props = match ServerProperties::load(&props_path)? {
+        Some(props) => props,
+        None => {
+            info!(path = %props_path.display(), "no server.properties yet; writing a vanilla one");
+            ServerProperties::new()
+        }
+    };
+    props
+        .save(&props_path)
+        .with_context(|| format!("failed to write {}", props_path.display()))?;
+
+    let eula_path = dir.join("eula.txt");
+    if args.accept_eula {
+        write_eula(&eula_path)
+            .with_context(|| format!("failed to write {}", eula_path.display()))?;
+        info!(path = %eula_path.display(), "accepted the Minecraft EULA");
+    } else if !eula_accepted(&eula_path) {
+        anyhow::bail!(
+            "the Minecraft EULA (https://aka.ms/MinecraftEULA) has not been accepted; \
+             start once with --accept-eula, or set eula=true in {}",
+            eula_path.display()
+        );
+    }
+
+    let ignored = props.unhonoured_keys();
+    info!(
+        path = %props_path.display(),
+        honoured = properties::HONOURED.len(),
+        not_acted_on_yet = ignored.len(),
+        "server.properties loaded"
+    );
+
+    let bind = args.bind.clone().unwrap_or_else(|| {
+        let ip = props
+            .optional_string("server-ip")
+            .unwrap_or_else(|| "0.0.0.0".to_string());
+        format!("{ip}:{}", props.integer("server-port"))
+    });
     let motd = args
         .motd
         .clone()
-        .unwrap_or_else(|| std::env::var("MOTD").unwrap_or_else(|_| "A LoadstoneMC server".into()));
-    let world_dir = args.world.clone();
+        .or_else(|| std::env::var("MOTD").ok())
+        .unwrap_or_else(|| props.string("motd"));
+    let world_dir = args
+        .world
+        .clone()
+        .unwrap_or_else(|| dir.join(props.string("level-name")));
+    let max_players = args
+        .max_players
+        .unwrap_or_else(|| props.integer("max-players"));
+    let online_mode = args
+        .online_mode
+        .unwrap_or_else(|| props.boolean("online-mode"));
+    let gamemode = match properties::gamemode_id(&props.string("gamemode")) {
+        Some(id) => id,
+        None => {
+            warn!(
+                value = %props.string("gamemode"),
+                "unknown gamemode in server.properties; using survival"
+            );
+            0
+        }
+    };
+    let hardcore = props.boolean("hardcore");
 
     let seed = match args.seed {
         Some(seed) => seed,
@@ -93,9 +171,13 @@ async fn main() -> anyhow::Result<()> {
 
     let net_config = ConnectionConfig {
         motd,
-        max_players: args.max_players,
+        max_players,
         online_players: 0,
-        online_mode: args.online_mode,
+        online_mode,
+        enable_status: props.boolean("enable-status"),
+        compression_threshold: props.integer("network-compression-threshold"),
+        gamemode,
+        hardcore,
         sessionserver_url: args.sessionserver_url,
         world: std::sync::Arc::new(std::sync::Mutex::new(world)),
         entities: std::sync::Arc::new(std::sync::Mutex::new(entities)),
@@ -103,16 +185,15 @@ async fn main() -> anyhow::Result<()> {
     };
     let world_handle = net_config.world.clone();
 
-    let listener = TcpListener::bind(&args.bind)
+    let listener = TcpListener::bind(&bind)
         .await
-        .with_context(|| format!("failed to bind {}", args.bind))?;
+        .with_context(|| format!("failed to bind {bind}"))?;
     info!(
         version = MINECRAFT_VERSION,
         protocol = PROTOCOL_VERSION,
-        online_mode = args.online_mode,
+        online_mode,
         motd = %net_config.motd,
-        "loadstone server listening on {}",
-        args.bind
+        "loadstone server listening on {bind}"
     );
 
     if args.save_interval > 0 {
@@ -224,6 +305,26 @@ fn spawn_autosave(
             save_world(&world, &dir, false);
         }
     });
+}
+
+/// Whether `eula.txt` already says `eula=true`, the test vanilla makes before it
+/// will start at all.
+fn eula_accepted(path: &Path) -> bool {
+    std::fs::read_to_string(path)
+        .map(|text| {
+            text.lines()
+                .any(|line| line.trim().eq_ignore_ascii_case("eula=true"))
+        })
+        .unwrap_or(false)
+}
+
+/// Records the operator's acceptance on disk, so later starts need no flag.
+fn write_eula(path: &Path) -> std::io::Result<()> {
+    std::fs::write(
+        path,
+        "#By changing the setting below to TRUE you are indicating your agreement to our EULA \
+         (https://aka.ms/MinecraftEULA).\neula=true\n",
+    )
 }
 
 fn save_world(world: &std::sync::Arc<std::sync::Mutex<World>>, dir: &Path, force: bool) {

@@ -19,6 +19,7 @@ small, fast, low-overhead core in the spirit of Pumpkin and Steel.
 | Terrain generation (deterministic value-noise hills, bedrock/stone/dirt/grass layers) | works |
 | World persistence (vanilla Anvil region files, seed sidecar, autosave, save on shutdown) | works |
 | Non-player entities (pigs, cows, sheep, chickens, zombies) with gravity, collision, wander/chase AI | works |
+| `server.properties` with vanilla 1.21.11's full key set, and the vanilla EULA gate | works (10 keys acted on, the rest preserved) |
 
 A vanilla client can ping the server, complete login, and finish the whole
 Configuration handshake: it negotiates `minecraft:core`, receives every
@@ -60,14 +61,15 @@ Requires Rust 1.80 or newer.
 
 ```bash
 cargo build --release
-cargo run -p loadstone-server --release -- --bind 0.0.0.0:25565 --motd "LoadstoneMC"
+cargo run -p loadstone-server --release -- --accept-eula
 ```
 
 From the project root, the `loadstone` launcher builds the release binary if
 needed and forwards every flag to it, so `./loadstone` is enough:
 
 ```bash
-./loadstone --bind 0.0.0.0:25565 --motd "LoadstoneMC"
+./loadstone --accept-eula                     # first run: accept the EULA and boot
+./loadstone                                   # every run after that
 
 # Online mode: encrypts the connection and verifies accounts with Mojang.
 ./loadstone --online-mode
@@ -76,6 +78,12 @@ needed and forwards every flag to it, so `./loadstone` is enough:
 #     LOADSTONE_NO_BUILD=1 ./loadstone                     # do not invoke cargo
 #     CARGO=/path/to/cargo ./loadstone                     # pick a specific cargo
 ```
+
+The server runs in the directory you start it from (or `--dir`), where it keeps
+`server.properties`, `eula.txt` and the world. Like vanilla, it refuses to start
+until the Minecraft EULA has been accepted, which `--accept-eula` records in
+`eula.txt` once so later starts need no flag. Every flag is optional apart from
+that first acceptance: the settings come from `server.properties`.
 
 The launcher prefers the rustup toolchain (`~/.cargo/bin/cargo`) over a possibly
 older distro `cargo`, and falls back to an existing `target/release/loadstone`
@@ -102,27 +110,66 @@ installed (`rustup target add x86_64-unknown-linux-musl`).
 ### Pterodactyl
 
 `pterodactyl/egg-loadstone.json` is a ready-to-import egg. The installer detects
-the machine architecture, downloads the matching static release binary and makes
-it executable; the runtime uses the Debian yolks image and needs no Java. The
-egg exposes the MOTD, max players, online mode, save interval and extra
-arguments as variables, binds the server to the allocated `SERVER_PORT`, and
-stops it gracefully by sending `stop` on stdin. Import it from
-**Nests → Import Egg**.
+the machine architecture, downloads the matching static release binary, makes it
+executable and writes `eula.txt` (installing the egg is the operator accepting
+the EULA, as with the official Minecraft egg); the runtime uses the Debian yolks
+image and needs no Java. The egg exposes the MOTD, max players, online mode,
+save interval and extra arguments as variables, binds the server to the
+allocated `SERVER_PORT`, and stops it gracefully by sending `stop` on stdin.
+Import it from **Nests → Import Egg**.
 
 Because the Pterodactyl entrypoint word-splits the startup command, the MOTD is
 not passed as an argument: the server reads the `MOTD` environment variable
 instead, so a description containing spaces works fine.
 
+Every flag except `--dir` and `--accept-eula` overrides the matching
+`server.properties` key only when it is actually given; on its own the file
+decides.
+
 | Flag | Default | Meaning |
 |---|---|---|
-| `--bind` | `0.0.0.0:25565` | Address to listen on |
-| `--motd` | `MOTD` env, else `A LoadstoneMC server` | Server list description |
-| `--max-players` | `20` | Players shown in the server list |
-| `--online-mode` | off | Require encryption + Mojang session verification |
+| `--dir` | `.` | Directory holding `server.properties`, `eula.txt` and the world |
+| `--accept-eula` | off | Accept the Minecraft EULA, writing `eula.txt` |
+| `--bind` | `server-ip`:`server-port` | Address to listen on |
+| `--motd` | `MOTD` env, else `motd` | Server list description |
+| `--max-players` | `max-players` | Players shown in the server list |
+| `--online-mode` | `online-mode` | Require encryption + Mojang session verification |
 | `--sessionserver-url` | Mojang's `hasJoined` | Base URL for session verification |
-| `--world` | `world` | World directory holding `region/` and the seed sidecar |
+| `--world` | `level-name`, under `--dir` | World directory holding `region/` and the seed sidecar |
 | `--seed` | saved seed, else `0` | Terrain seed for a new world |
 | `--save-interval` | `30` | Seconds between autosaves of dirty chunks (`0` disables) |
+
+### Configuration
+
+A first run writes a `server.properties` containing **exactly the 67 keys a real
+1.21.11 server writes for itself, in the same order** (alphabetical, as Java's
+`Properties.store` emits them), so the file can be diffed against a vanilla one
+line for line. `crates/loadstone-server/tests/data/vanilla-server.properties`
+is the captured reference and a test compares the built-in table against it in
+keys, order and values, which is how `enable-command-block` (dropped in 1.21.11)
+and the whole `management-server-*` family were found to be wrong here before.
+Keys vanilla has since dropped are not added, and a file that still carries them
+keeps them.
+
+Ten keys take effect today: `server-ip`, `server-port`, `motd`, `max-players`,
+`online-mode`, `level-name`, `enable-status`, `network-compression-threshold`,
+`gamemode` and `hardcore`. The other 57 are read, written back verbatim and
+counted in the startup log:
+
+```
+INFO server.properties loaded path=./server.properties honoured=10 not_acted_on_yet=57
+```
+
+so a setting is never silently dropped before the feature behind it exists —
+`rcon`, `white-list` and `resource-pack-*` need subsystems (RCON, player data, a
+transfer path) that are not here yet. `view-distance` and
+`simulation-distance` are deliberately in that second group: the chunk streamer
+keeps its own small radius so a joining client finishes "downloading terrain"
+quickly, and having the file say 10 while the login packet says 1 would be worse
+than either value alone. Two other deliberate deviations: `level-type` is
+written unescaped (`minecraft:normal`, not `minecraft\:normal`) though the
+escaped form is read correctly, and `management-server-secret` is left empty
+rather than generated, since nothing here speaks that protocol.
 
 The server saves dirty chunks on a timer and force-saves everything on shutdown:
 `Ctrl-C`/SIGINT, `SIGTERM`, or `stop`/`exit`/`quit` typed on stdin (which is how
@@ -140,7 +187,7 @@ Logging is controlled by `RUST_LOG` (for example `RUST_LOG=loadstone=debug`).
 | `loadstone-net` | Connection lifecycle, framing, AES-128/CFB8, login flow, session auth |
 | `loadstone-world` | Terrain generation, the mutable world model, mob entities with gravity/collision/AI, Anvil region persistence, and the 1.21.11 chunk wire format (paletted containers, heightmaps, sky light) |
 | `loadstone-registry` | Synchronized registry and network tag data (embedded JSON) |
-| `loadstone-server` | The `loadstone` binary: CLI, listener, per-connection tasks |
+| `loadstone-server` | The `loadstone` binary: CLI, `server.properties` + EULA handling, listener, per-connection tasks |
 
 `crates/loadstone-registry/data/` holds the captured 1.21.11 registry and tag
 data, embedded into the binary at build time with `include_str!`. It is
@@ -178,7 +225,12 @@ movement arrives as an entity sync, that a block edit by one is broadcast to the
 other, and that a disconnect produces `player_remove` + `remove_entities`. A
 fourth test starts the entity ticker and checks that a joining player is sent all
 seven starting mobs with their `minecraft:entity_type` ids and then sees them
-move.
+move. Three more pin the configuration keys to the packets they change:
+gamemode/hardcore/max-players reach the Play login packet, a negative
+`network-compression-threshold` means no Set Compression and an uncompressed
+handshake, and `enable-status=false` closes a ping to the status port instead of
+answering it. `crates/loadstone-server/src/properties.rs` carries its own tests
+for the key set, the defaults, escaping and round-trip stability.
 
 `tools/live_login_check.py` does the same over a socket against a real running
 binary, with a client written independently of the server (Python `cryptography`):
@@ -228,7 +280,9 @@ is non-zero if anything fails, so it can gate a release.
   signature field (profile-key signatures left login in 1.19.3). Mojang-signed
   key chains arrive later, in the Play state as a serverbound
   `chat_session_update`, and that is where signature verification belongs.
-- Compression is enabled at a 256-byte threshold, matching the vanilla default.
+- Compression is enabled at a 256-byte threshold, matching the vanilla default,
+  and `network-compression-threshold` moves or disables it: a negative value
+  suppresses the Set Compression packet and leaves the stream uncompressed.
 - **Known packs.** The server offers `minecraft:core` and expects it back. Once
   the client confirms it knows the pack, every synchronized registry entry is
   sent with its NBT omitted and the client resolves the data from its own copy of
@@ -261,4 +315,4 @@ is non-zero if anything fails, so it can gate a release.
 
 ## License
 
-MIT, as declared in `Cargo.toml`. The `LICENSE` file itself is not committed yet.
+MIT, as declared in `Cargo.toml` and in the `LICENSE` file.

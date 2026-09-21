@@ -29,6 +29,7 @@ use loadstone_protocol::packets::play::{
     SpawnPosition, SyncEntityPosition, SystemChat, TeleportConfirm, UnloadChunk, UpdateHealth,
     UpdateTime, ENTITY_TYPE_PLAYER,
 };
+use loadstone_protocol::packets::status::StatusRequest;
 use loadstone_protocol::packets::Handshake;
 use loadstone_protocol::write_varint;
 use loadstone_protocol::{Packet, PacketReader, PROTOCOL_VERSION};
@@ -1078,4 +1079,83 @@ async fn online_login_rejects_an_unpaired_verify_token() {
     // the mock is still waiting for a request that must never arrive.
     assert!(recorded.lock().unwrap().is_empty());
     mock_server.abort();
+}
+
+/// The settings a `server.properties` file carries have to reach the packet that
+/// acts on them, or the file is decoration.
+#[tokio::test]
+async fn world_settings_reach_the_login_packet() {
+    let mut config = base_config(false);
+    config.gamemode = 1; // creative
+    config.hardcore = true;
+    config.max_players = 7;
+    let (addr, server) = spawn_server(config).await;
+
+    let (_client, _uuid, snapshot) = offline_join(&addr, "Alice").await;
+    assert_eq!(snapshot.login.world_state.gamemode, 1);
+    assert!(snapshot.login.is_hardcore);
+    assert_eq!(snapshot.login.max_players, 7);
+
+    server.abort();
+}
+
+/// A negative `network-compression-threshold` is vanilla's "off": no Set
+/// Compression packet, and every frame after it stays uncompressed.
+#[tokio::test]
+async fn compression_can_be_turned_off_end_to_end() {
+    let mut config = base_config(false);
+    config.compression_threshold = -1;
+    let (addr, server) = spawn_server(config).await;
+
+    let mut client = Client::connect(&addr).await;
+    client.handshake(2).await;
+    let uuid = client.login_start("Alice").await;
+
+    let (id, body) = client.recv_timed().await;
+    assert_eq!(
+        id,
+        LoginSuccess::ID,
+        "compression was announced despite a negative threshold"
+    );
+    let success = LoginSuccess::decode(&mut PacketReader::new(&body)).unwrap();
+    assert_eq!(success.uuid, uuid);
+    assert!(client.compression.is_none());
+
+    // The rest of the handshake has to work without a codec switch.
+    client.acknowledged().await;
+    client.complete_configuration().await;
+    let snapshot = client.enter_play(uuid).await;
+    assert_eq!(snapshot.login.entity_id, 0);
+
+    server.abort();
+}
+
+/// `enable-status=false` means the ping is not answered at all.
+#[tokio::test]
+async fn status_can_be_turned_off() {
+    let mut config = base_config(false);
+    config.enable_status = false;
+    let (addr, server) = spawn_server(config).await;
+
+    let mut client = Client::connect(&addr).await;
+    client.handshake(1).await;
+    client.send_packet(StatusRequest::ID, &[]).await;
+
+    let mut byte = [0u8; 1];
+    let read = tokio::time::timeout(Duration::from_secs(5), client.stream.read(&mut byte))
+        .await
+        .expect("the server kept a status connection open with enable-status=false");
+    match read {
+        Ok(0) => {}
+        // Closing with the request still unread makes Linux answer with a reset
+        // rather than a clean end-of-file.
+        Err(error) => assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::ConnectionReset,
+            "unexpected read error: {error}"
+        ),
+        Ok(n) => panic!("the server answered a disabled status ping with {n} bytes"),
+    }
+
+    server.abort();
 }

@@ -1019,16 +1019,23 @@ def spawn_server(binary: str, port: int, motd: str, online: bool, session_url: s
     """Starts the server on a fixed seed in a throwaway world directory so the
     checks are reproducible and never touch a real save."""
     world_dir = tempfile.mkdtemp(prefix="loadstone-live-world-")
+    # A scratch --dir keeps the `server.properties`, `eula.txt` and world this
+    # check needs out of the checkout, and the online mode is passed explicitly
+    # so the run does not depend on what that file happens to default to.
+    scratch = tempfile.mkdtemp(prefix="loadstone-live-dir-")
     command = [
         binary,
+        "--dir", scratch,
+        "--accept-eula",
         "--bind", f"127.0.0.1:{port}",
         "--motd", motd,
         "--seed", "0",
         "--world", world_dir,
         "--save-interval", "0",
+        "--online-mode=" + ("true" if online else "false"),
     ]
     if online:
-        command += ["--online-mode", "--sessionserver-url", session_url or ""]
+        command += ["--sessionserver-url", session_url or ""]
     process = subprocess.Popen(
         command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
     )

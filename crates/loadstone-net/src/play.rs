@@ -208,9 +208,9 @@ async fn run_play(
     // 1. Login: dimension, spawn info and world rendering settings.
     let login = PlayLogin {
         entity_id,
-        is_hardcore: false,
+        is_hardcore: config.hardcore,
         world_names: vec!["minecraft:overworld".to_string()],
-        max_players: 20,
+        max_players: config.max_players,
         view_distance: VIEW_DISTANCE,
         simulation_distance: SIMULATION_DISTANCE,
         reduced_debug_info: false,
@@ -220,7 +220,7 @@ async fn run_play(
             dimension_id,
             dimension_name: "minecraft:overworld".to_string(),
             hashed_seed: 0,
-            gamemode: 0, // survival
+            gamemode: config.gamemode,
             previous_gamemode: 255,
             is_debug: false,
             is_flat: false,
