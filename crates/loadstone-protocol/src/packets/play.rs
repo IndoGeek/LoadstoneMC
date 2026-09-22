@@ -1068,9 +1068,11 @@ pub struct SpawnEntity {
     pub x: f64,
     pub y: f64,
     pub z: f64,
-    pub vx: i16,
-    pub vy: i16,
-    pub vz: i16,
+    /// Velocity in blocks per tick, in the low-precision vector encoding (see
+    /// [`write_lp_vec3`]).
+    pub vx: f64,
+    pub vy: f64,
+    pub vz: f64,
     pub pitch: i8,
     pub yaw: i8,
     pub head_yaw: i8,
@@ -1110,9 +1112,9 @@ impl SpawnEntity {
             x,
             y,
             z,
-            vx: 0,
-            vy: 0,
-            vz: 0,
+            vx: 0.0,
+            vy: 0.0,
+            vz: 0.0,
             pitch: degree_to_angle(pitch),
             yaw: degree_to_angle(yaw),
             head_yaw: degree_to_angle(yaw),
@@ -1130,33 +1132,142 @@ impl Packet for SpawnEntity {
             .write_varint(self.entity_type)
             .write_f64(self.x)
             .write_f64(self.y)
-            .write_f64(self.z)
-            .write_i16(self.vx)
-            .write_i16(self.vy)
-            .write_i16(self.vz)
-            .write_i8(self.pitch)
+            .write_f64(self.z);
+        write_lp_vec3(out, self.vx, self.vy, self.vz);
+        out.write_i8(self.pitch)
             .write_i8(self.yaw)
             .write_i8(self.head_yaw)
             .write_varint(self.data);
     }
 
     fn decode(reader: &mut PacketReader<'_>) -> Result<Self, ProtocolError> {
+        let entity_id = reader.read_varint()?;
+        let uuid = reader.read_uuid()?;
+        let entity_type = reader.read_varint()?;
+        let x = reader.read_f64()?;
+        let y = reader.read_f64()?;
+        let z = reader.read_f64()?;
+        let (vx, vy, vz) = read_lp_vec3(reader)?;
         Ok(Self {
-            entity_id: reader.read_varint()?,
-            uuid: reader.read_uuid()?,
-            entity_type: reader.read_varint()?,
-            x: reader.read_f64()?,
-            y: reader.read_f64()?,
-            z: reader.read_f64()?,
-            vx: reader.read_i16()?,
-            vy: reader.read_i16()?,
-            vz: reader.read_i16()?,
+            entity_id,
+            uuid,
+            entity_type,
+            x,
+            y,
+            z,
+            vx,
+            vy,
+            vz,
             pitch: reader.read_i8()?,
             yaw: reader.read_i8()?,
             head_yaw: reader.read_i8()?,
             data: reader.read_varint()?,
         })
     }
+}
+
+// ---------------------------------------------------------------------------
+// The low-precision vector.
+// ---------------------------------------------------------------------------
+
+/// Component magnitude below which a vector counts as still (the client's own
+/// `ABS_MIN_VALUE`).
+const LP_VEC3_MIN: f64 = 3.051944088384301e-5;
+/// Largest value the 15-bit components of a packed vector can carry.
+const LP_VEC3_MAX_QUANTIZED: f64 = 32766.0;
+/// The client's own clamp on every component.
+const LP_VEC3_MAX_VALUE: f64 = 1.7179869183e10;
+
+/// Write entity velocity in the low-precision vector encoding 1.21.9+ uses.
+///
+/// This encoding is a trap worth naming. A vector whose largest component is
+/// below [`LP_VEC3_MIN`] is a **single `0x00` byte**, not three zeroes, and that
+/// is what a standing entity has. A real vector packs its three components into
+/// 48 bits (three marker bits, then 15 bits each) with a trailing varint when the
+/// shared scale does not fit in those two remaining bits.
+///
+/// Writing the three shorts the older protocol used costs five bytes of drift on
+/// every still entity, and the client reports that drift exactly:
+/// `found 5 bytes extra whilst reading packet clientbound/minecraft:add_entity`.
+pub fn write_lp_vec3(out: &mut PacketWriter, x: f64, y: f64, z: f64) {
+    let (x, y, z) = (sanitize_lp(x), sanitize_lp(y), sanitize_lp(z));
+    let max = x.abs().max(y.abs()).max(z.abs());
+    if max < LP_VEC3_MIN {
+        out.write_u8(0);
+        return;
+    }
+
+    let scale = max.ceil();
+    let needs_continuation = scale > 3.0;
+    let markers = if needs_continuation {
+        (scale as u64 % 4) | 4
+    } else {
+        scale as u64
+    };
+    let packed = markers
+        + pack_lp(x / scale) * 0x8
+        + pack_lp(y / scale) * 0x40000
+        + pack_lp(z / scale) * 0x200000000;
+
+    out.write_u8((packed % 0x100) as u8)
+        .write_u8((packed / 0x100 % 0x100) as u8);
+    // The high 32 bits go big-endian: byte 2 is the most significant of them.
+    let high = (packed / 0x10000) as u32;
+    out.write_u8((high >> 24) as u8)
+        .write_u8((high >> 16) as u8)
+        .write_u8((high >> 8) as u8)
+        .write_u8(high as u8);
+
+    if needs_continuation {
+        out.write_varint((scale / 4.0) as i32);
+    }
+}
+
+/// Read a low-precision vector written by [`write_lp_vec3`].
+pub fn read_lp_vec3(reader: &mut PacketReader<'_>) -> Result<(f64, f64, f64), ProtocolError> {
+    let a = reader.read_u8()?;
+    if a == 0 {
+        return Ok((0.0, 0.0, 0.0));
+    }
+
+    let b = u64::from(reader.read_u8()?);
+    let bytes = reader.read_bytes(4)?;
+    let high = u64::from(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]));
+    let packed = high * 0x10000 + b * 0x100 + u64::from(a);
+
+    let mut scale = f64::from(a & 3);
+    if a & 4 == 4 {
+        scale += f64::from(reader.read_varint()?) * 4.0;
+    }
+
+    Ok((
+        unpack_lp(packed, 3) * scale,
+        unpack_lp(packed, 18) * scale,
+        unpack_lp(packed, 33) * scale,
+    ))
+}
+
+fn sanitize_lp(value: f64) -> f64 {
+    if value.is_nan() {
+        0.0
+    } else {
+        value.clamp(-LP_VEC3_MAX_VALUE, LP_VEC3_MAX_VALUE)
+    }
+}
+
+/// Quantize a component in `-1..=1` into 15 bits.
+fn pack_lp(value: f64) -> u64 {
+    ((value * 0.5 + 0.5) * LP_VEC3_MAX_QUANTIZED)
+        .round()
+        .max(0.0) as u64
+}
+
+/// The inverse of [`pack_lp`], reading the component that lives at `shift` bits
+/// into the packed vector.
+fn unpack_lp(packed: u64, shift: u32) -> f64 {
+    let quantized = (packed >> shift) % 0x8000;
+    let quantized = quantized.min(LP_VEC3_MAX_QUANTIZED as u64) as f64;
+    quantized * 2.0 / LP_VEC3_MAX_QUANTIZED - 1.0
 }
 
 /// Convert a yaw/pitch in degrees to the protocol's turn (byte) unit.
@@ -2165,9 +2276,12 @@ mod tests {
             x: 1.0,
             y: 2.0,
             z: 3.0,
-            vx: 1,
-            vy: -2,
-            vz: 3,
+            // Components at the vector's own scale (and zeroes) survive the
+            // low-precision round trip exactly; anything between them is
+            // quantized, which the client sees too.
+            vx: 3.0,
+            vy: 0.0,
+            vz: -3.0,
             pitch: 4,
             yaw: 5,
             head_yaw: 6,
@@ -2210,5 +2324,65 @@ mod tests {
         roundtrip(BundleDelimiter);
         assert_eq!(degree_to_angle(180.0), -128);
         assert_eq!(degree_to_angle(90.0), 64);
+    }
+
+    fn lp_vec3_bytes(x: f64, y: f64, z: f64) -> Vec<u8> {
+        let mut writer = PacketWriter::new();
+        write_lp_vec3(&mut writer, x, y, z);
+        writer.as_slice().to_vec()
+    }
+
+    /// An entity that is not moving spends **one** byte on its velocity.
+    ///
+    /// 1.21.9+ encodes a vector this way, so anything that writes three zero
+    /// shorts instead is five bytes long per spawn — which is the number a real
+    /// client reports back as `found 5 bytes extra whilst reading packet
+    /// clientbound/minecraft:add_entity`.
+    #[test]
+    fn a_still_entity_costs_one_byte_of_velocity() {
+        assert_eq!(lp_vec3_bytes(0.0, 0.0, 0.0), vec![0x00]);
+
+        let mut writer = PacketWriter::new();
+        SpawnEntity::player(1, Uuid::from_u128(1), 0.0, 64.0, 0.0, 0.0, 0.0).encode(&mut writer);
+        let encoded = writer.as_slice();
+        // 1 id + 16 uuid + 2 type + 24 position + 1 velocity + 3 turns + 1 data.
+        assert_eq!(encoded.len(), 48);
+    }
+
+    /// Vanilla's own bytes for a moving entity, from a real 1.21.11 server.
+    /// Decoding and re-encoding them has to give the same six bytes back.
+    #[test]
+    fn the_low_precision_vector_roundtrips_vanilla_bytes() {
+        const VANILLA_VELOCITY: [u8; 6] = [0xf9, 0xff, 0x7f, 0xfe, 0xeb, 0xed];
+        let mut reader = PacketReader::new(&VANILLA_VELOCITY);
+        let (x, y, z) = read_lp_vec3(&mut reader).unwrap();
+        assert!(reader.is_empty(), "a 6-byte vector reads as 6 bytes");
+        assert_eq!(write_lp_vec3_bytes(x, y, z), VANILLA_VELOCITY);
+    }
+
+    #[test]
+    fn low_precision_vectors_roundtrip() {
+        for (x, y, z) in [
+            (0.0, 0.0, 0.0),   // one byte
+            (0.1, 0.0, 0.0),   // one component
+            (0.0, -0.4, 0.1),  // a fall
+            (1.0, -1.0, 0.5),  // scale fits the marker byte
+            (3.7, 0.0, -2.5),  // scale needs the varint
+            (-12.0, 4.0, 0.0), // negative and beyond the 2-bit scale
+        ] {
+            let bytes = lp_vec3_bytes(x, y, z);
+            let mut reader = PacketReader::new(&bytes);
+            let (dx, dy, dz) = read_lp_vec3(&mut reader).unwrap();
+            assert!(reader.is_empty(), "leftover bytes for {x},{y},{z}");
+            assert_eq!(
+                write_lp_vec3_bytes(dx, dy, dz),
+                bytes,
+                "re-encode {x},{y},{z}"
+            );
+        }
+    }
+
+    fn write_lp_vec3_bytes(x: f64, y: f64, z: f64) -> Vec<u8> {
+        lp_vec3_bytes(x, y, z)
     }
 }

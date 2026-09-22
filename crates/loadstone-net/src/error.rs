@@ -1,3 +1,5 @@
+use std::io;
+
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -20,4 +22,30 @@ pub enum NetError {
     Auth(String),
     #[error("internal server error: {0}")]
     Internal(String),
+}
+
+/// True for the socket errors a departing client produces: it closed the
+/// connection, or the kernel reported that the peer is gone. These are ordinary
+/// events (vanilla logs `lost connection: Disconnected`), not server faults, and
+/// the caller should not report them as errors.
+pub(crate) fn is_disconnect_kind(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::BrokenPipe
+    )
+}
+
+impl NetError {
+    /// Whether this error is just the client going away rather than a fault on
+    /// our side.
+    pub fn is_client_disconnect(&self) -> bool {
+        match self {
+            NetError::Closed => true,
+            NetError::Frame(crate::codec::FrameError::Io(e)) => is_disconnect_kind(e),
+            _ => false,
+        }
+    }
 }

@@ -337,7 +337,7 @@ async fn run_play(
     info!(name = %username, entity_id, "player entered the world");
     // Vanilla's line, and the one a player's "did I get in?" is answered by.
     info!("{username} joined the game");
-    play_loop(
+    let outcome = play_loop(
         &mut conn,
         uuid,
         username,
@@ -347,7 +347,30 @@ async fn run_play(
         loaded_chunks,
         rx,
     )
-    .await
+    .await;
+
+    // A client that dies mid-session (its own crash, a pulled cable, a killed
+    // process) takes the reason with it: it just closes the socket, and all we
+    // see is an EOF. Whatever it rejected is among the last things sent to it,
+    // so put those on the wire's own line — a client's `N bytes extra whilst
+    // reading packet X` complaint can then be matched against the real bytes.
+    if outcome.is_err() {
+        let last = conn
+            .recent_packets()
+            .map(|(id, body)| format!("id={id} len={} hex={}", body.len(), hex(body)))
+            .collect::<Vec<_>>()
+            .join("; ");
+        if !last.is_empty() {
+            info!(name = %username, %last, "last packets sent before the connection ended");
+        }
+    }
+
+    outcome
+}
+
+/// Lower-case hex, for the wire lines above.
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 /// A tab-list "add player" entry with the fields we always populate.

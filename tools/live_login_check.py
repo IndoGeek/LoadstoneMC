@@ -103,7 +103,7 @@ PKT_PLAY_SYSTEM_CHAT = 0x77
 PKT_PLAY_REMOVE_ENTITIES = 0x4B
 
 # Play state, serverbound.
-PKT_PLAY_KEEP_ALIVE_RESPONSE = 0x19
+PKT_PLAY_KEEP_ALIVE_RESPONSE = 0x1B
 PKT_PLAY_CHUNK_BATCH_RECEIVED = 0x0A
 PKT_PLAY_TELEPORT_CONFIRM = 0x00
 PKT_PLAY_CHAT_MESSAGE = 0x08
@@ -155,6 +155,37 @@ def read_varint(data: bytes, start: int = 0) -> tuple[int, int]:
         if not byte & 0x80:
             return value, index - start
         position += 7
+
+
+def parse_spawn_entity(body: bytes) -> tuple[int, int, int, int]:
+    """Walk a spawn_entity body, independently of the server's encoder.
+
+    Returns (entity_id, entity_type, velocity_bytes, leftover). The leftover is
+    the point: a client rejects this packet by name when a body runs past its
+    end ("found N bytes extra whilst reading packet
+    clientbound/minecraft:add_entity"), and the fields here are written from
+    the protocol's own description rather than from the Rust encoder, so a bug
+    the two sides share cannot hide in both.
+    """
+    entity_id, n = read_varint(body)
+    i = n + 16  # UUID
+    entity_type, n = read_varint(body, i)
+    i += n + 24  # type, then x/y/z as f64
+    # Velocity is a low-precision vector: a leading zero byte means a still
+    # entity and ends the field there; otherwise three components share a scale
+    # across six bytes, plus a varint of further scale when marker bit 2 is set.
+    first = body[i]
+    if first == 0:
+        velocity_bytes = 1
+    else:
+        velocity_bytes = 6
+        if first & 4:
+            _, n = read_varint(body, i + 6)
+            velocity_bytes += n
+    i += velocity_bytes + 3  # velocity, then pitch/yaw/head yaw
+    _, n = read_varint(body, i)  # object data
+    i += n
+    return entity_id, entity_type, velocity_bytes, len(body) - i
 
 
 def write_string(text: str) -> bytes:
@@ -399,8 +430,9 @@ def drive_into_play(client: Client, name: str, expected_entity_id: int | None = 
             if heights:
                 surfaces[(chunk_x, chunk_z)] = heights
         elif packet_id == PKT_PLAY_SPAWN_ENTITY:
-            entity_id, size = read_varint(body)
-            entity_type, _ = read_varint(body, size + 16)
+            entity_id, entity_type, velocity_bytes, leftover = parse_spawn_entity(body)
+            check(leftover == 0, "spawn_entity ends exactly where its body does",
+                  f"{leftover} bytes past the end (velocity {velocity_bytes} bytes)")
             if entity_type != 155:  # 155 is minecraft:player
                 mob_spawns[entity_id] = entity_type
         elif packet_id == PKT_PLAY_CHUNK_BATCH_START:
@@ -623,8 +655,12 @@ def check_mobs(host: str, port: int) -> None:
         while len(spawned) < 7 or not moved:
             packet_id, body = next_play_packet(client)
             if packet_id == PKT_PLAY_SPAWN_ENTITY:
-                entity_id, size = read_varint(body)
-                entity_type, _ = read_varint(body, size + 16)
+                entity_id, entity_type, velocity_bytes, leftover = parse_spawn_entity(body)
+                check(leftover == 0, "spawn_entity ends exactly where its body does",
+                      f"{leftover} bytes past the end (velocity {velocity_bytes} bytes)")
+                check(velocity_bytes == 1,
+                      "a motionless mob spends one byte on its velocity",
+                      f"{velocity_bytes} bytes")
                 if entity_type != 155:
                     spawned[entity_id] = entity_type
             elif packet_id == PKT_PLAY_SYNC_ENTITY_POSITION:

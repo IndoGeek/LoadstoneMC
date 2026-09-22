@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -127,9 +127,22 @@ pub struct RawPacket {
 
 /// A registered connection. The transport switches from plain to encrypted
 /// mid-login, after which all frames go through AES/CFB8.
+/// How many of the most recent small packets are kept per connection, and the
+/// size above which a packet is too big to be the one a client complains about.
+pub const RECENT_PACKETS: usize = 4;
+pub const RECENT_PACKET_BYTES: usize = 128;
+
 pub struct Connection {
     transport: Transport,
     compression_threshold: Option<i32>,
+    /// The last few small clientbound packets, oldest first.
+    ///
+    /// A client that dies mid-session says nothing: it just closes the socket,
+    /// so the reason goes with it. What it rejected is the last thing it was
+    /// sent, and a client's `N bytes extra whilst reading packet X` complaint is
+    /// always about a small packet whose layout is wrong, so the large ones
+    /// (chunks, registries) are left out of this window.
+    recent: VecDeque<(i32, Vec<u8>)>,
 }
 
 /// A connection owns exactly one of these for its whole lifetime, so the size
@@ -196,7 +209,13 @@ impl Connection {
         Self {
             transport: Transport::Plain(stream),
             compression_threshold: None,
+            recent: VecDeque::new(),
         }
+    }
+
+    /// The small packets written most recently, oldest first.
+    pub fn recent_packets(&self) -> impl Iterator<Item = (i32, &[u8])> {
+        self.recent.iter().map(|(id, body)| (*id, body.as_slice()))
     }
 
     fn set_compression(&mut self, threshold: i32) {
@@ -205,7 +224,17 @@ impl Connection {
 
     pub(crate) async fn read_packet(&mut self) -> Result<RawPacket, NetError> {
         let InboundFrame { packet_id, payload } =
-            read_frame(&mut self.transport, self.compression_threshold).await?;
+            match read_frame(&mut self.transport, self.compression_threshold).await {
+                Ok(frame) => frame,
+                // A client that goes away closes the socket, which shows up as
+                // EOF (or a reset) part-way through a read. That is an ordinary
+                // disconnect, not a fault on our side, so it is reported as such
+                // wherever it happens rather than as an IO error.
+                Err(FrameError::Io(e)) if crate::error::is_disconnect_kind(&e) => {
+                    return Err(NetError::Closed);
+                }
+                Err(e) => return Err(e.into()),
+            };
         Ok(RawPacket {
             id: packet_id,
             body: payload,
@@ -223,6 +252,12 @@ impl Connection {
         } else {
             debug!(id, len = body.len(), "clientbound packet");
         }
+        if body.len() <= RECENT_PACKET_BYTES {
+            if self.recent.len() == RECENT_PACKETS {
+                self.recent.pop_front();
+            }
+            self.recent.push_back((id, body.to_vec()));
+        }
         write_frame(&mut self.transport, id, body, self.compression_threshold).await?;
         Ok(())
     }
@@ -231,11 +266,13 @@ impl Connection {
         let Connection {
             transport,
             compression_threshold,
+            recent,
         } = self;
         let transport = transport.try_encrypt(&secret)?;
         Ok(Connection {
             transport,
             compression_threshold,
+            recent,
         })
     }
 }
@@ -250,13 +287,8 @@ pub async fn run_connection(stream: TcpStream, config: ConnectionConfig) -> Resu
     let peer = stream.peer_addr().ok();
     let mut conn = Connection::new(stream);
 
-    let frame = match conn.read_packet().await {
-        Ok(f) => f,
-        Err(NetError::Frame(FrameError::Io(e))) if e.kind() == io::ErrorKind::UnexpectedEof => {
-            return Err(NetError::Closed);
-        }
-        Err(e) => return Err(e),
-    };
+    // `read_packet` already maps a departing client to `Closed`.
+    let frame = conn.read_packet().await?;
 
     if frame.id != Handshake::ID {
         warn!(?peer, id = frame.id, "expected handshake packet");

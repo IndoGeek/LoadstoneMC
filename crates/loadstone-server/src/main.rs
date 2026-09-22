@@ -7,7 +7,7 @@ use loadstone_net::{run_connection, tick_entities, ConnectionConfig};
 use loadstone_protocol::{MINECRAFT_VERSION, PROTOCOL_VERSION};
 use loadstone_world::{world, EntityStore, World};
 use tokio::net::TcpListener;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 mod logging;
 mod properties;
@@ -316,7 +316,15 @@ async fn main() -> anyhow::Result<()> {
                 let cfg = net_config.clone();
                 tokio::spawn(async move {
                     if let Err(e) = run_connection(stream, cfg).await {
-                        error!(%peer, "connection error: {e}");
+                        if e.is_client_disconnect() {
+                            // The client closed the socket. Vanilla logs this as
+                            // a normal disconnect (`lost connection`), never as a
+                            // server error, and so do we — the join/leave lines
+                            // already say who it was.
+                            debug!(%peer, "client disconnected");
+                        } else {
+                            error!(%peer, "connection error: {e}");
+                        }
                     }
                 });
             }
