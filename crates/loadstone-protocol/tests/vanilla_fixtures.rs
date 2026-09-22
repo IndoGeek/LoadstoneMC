@@ -11,13 +11,23 @@
 //! check is that a decode of the real packet **consumes every byte and asserts
 //! specific values**: a field that is one byte too wide or too narrow cannot do
 //! both.
+//!
+//! The unprefixed files (and `manifest.json`) come from the data generator run
+//! described in `tools/capture_vanilla_registries.py`. The `vanilla-` prefixed
+//! ones are the bodies a real 1.21.11 server sent while a throwaway client
+//! joined its flat test world, keeping the largest body seen for each packet
+//! type so each fixture exercises a populated example — which is why
+//! `vanilla-add_entity` is a slime and not the player its test is about.
 
 use loadstone_protocol::chunk::{
     section_index, ChunkSection, Heightmap, HEIGHTMAP_MOTION_BLOCKING, HEIGHTMAP_WORLD_SURFACE,
     OVERWORLD_SECTION_COUNT,
 };
 use loadstone_protocol::packets::play::{
-    ClientPosition, MapChunk, PlayLogin, SetChunkCacheCenter, SpawnPosition,
+    Abilities, BundleDelimiter, ChunkBatchFinished, ChunkBatchStart, ClientPosition,
+    EntityMetadata, Experience, MapChunk, PlayLogin, PlayerInfoUpdate, RemoveEntities, ServerData,
+    SetChunkCacheCenter, SpawnEntity, SpawnPosition, SyncEntityPosition, UpdateHealth, UpdateTime,
+    ENTITY_TYPE_PLAYER,
 };
 use loadstone_protocol::{Packet, PacketReader};
 
@@ -45,6 +55,53 @@ fn decode_exactly<P: Packet>(name: &str) -> P {
         body.len()
     );
     packet
+}
+
+/// Decode a captured packet and encode it again; the bytes must come back
+/// identical.
+///
+/// Decoding proves the *reader* matches vanilla, and that is all the checks above
+/// do. A client only ever sees the writer, and a packet whose encoder omits a
+/// field, writes one at the wrong width, or puts them in a different order still
+/// decodes here — our reader and writer share one reading of the protocol, so they
+/// agree with each other while disagreeing with Mojang. Vanilla's own bytes are
+/// the only thing that can tell the two apart, so this is the check that a real
+/// client's "network protocol error" is asking for.
+fn assert_encoder_reproduces<P: Packet>(name: &str) {
+    let body = fixture(name);
+    let mut reader = PacketReader::new(&body);
+    let decoded =
+        P::decode(&mut reader).unwrap_or_else(|err| panic!("decoding the captured {name}: {err}"));
+
+    let mut writer = loadstone_protocol::PacketWriter::new();
+    decoded.encode(&mut writer);
+    let encoded = writer.as_slice();
+
+    assert_eq!(
+        encoded.len(),
+        body.len(),
+        "re-encoding the captured {name} gives {} bytes where vanilla sent {}: this \
+         encoder does not write the same fields\nvanilla: {}\nours:    {}",
+        encoded.len(),
+        body.len(),
+        hex(&body),
+        hex(encoded)
+    );
+    assert_eq!(
+        encoded,
+        body.as_slice(),
+        "re-encoding the captured {name} gives different bytes\nvanilla: {}\nours:    {}",
+        hex(&body),
+        hex(encoded)
+    );
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// `x`(26) | `z`(26) | `y`(12), most significant field first, each signed.
@@ -251,6 +308,19 @@ fn every_captured_fixture_is_decoded_by_a_test() {
         "position",
         "update_view_position",
         "map_chunk",
+        "vanilla-add_entity",
+        "vanilla-set_entity_data",
+        "vanilla-player_info_update",
+        "vanilla-set_health",
+        "vanilla-set_experience",
+        "vanilla-set_time",
+        "vanilla-player_abilities",
+        "vanilla-chunk_batch_start",
+        "vanilla-chunk_batch_finished",
+        "vanilla-entity_position_sync",
+        "vanilla-remove_entities",
+        "vanilla-server_data",
+        "vanilla-bundle_delimiter",
     ];
     // Captured, but this crate has nothing to decode it with yet: it has no
     // `level_chunks_load_start` packet, because this server does not send one. The
@@ -279,4 +349,124 @@ fn every_captured_fixture_is_decoded_by_a_test() {
         uncovered.is_empty(),
         "these captured packets have no decode test: {uncovered:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The other half: our encoder must produce the bytes vanilla produced.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_encoder_writes_vanilla_s_play_login() {
+    assert_encoder_reproduces::<PlayLogin>("login");
+}
+
+#[test]
+fn the_encoder_writes_vanilla_s_spawn_position() {
+    assert_encoder_reproduces::<SpawnPosition>("spawn_position");
+}
+
+#[test]
+fn the_encoder_writes_vanilla_s_view_centre() {
+    assert_encoder_reproduces::<SetChunkCacheCenter>("update_view_position");
+}
+
+#[test]
+fn the_encoder_writes_vanilla_s_player_position() {
+    assert_encoder_reproduces::<ClientPosition>("position");
+}
+
+#[test]
+fn the_encoder_writes_vanilla_s_chunk() {
+    assert_encoder_reproduces::<MapChunk>("map_chunk");
+}
+
+// ---------------------------------------------------------------------------
+// Packets this server sends in Play that are not the login/chunk core.
+//
+// These were the gap: a real client rejected the stream while every test here
+// passed, because nothing had ever compared them with bytes vanilla sent.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn spawn_entity_matches_the_captured_packet() {
+    let packet = decode_exactly::<SpawnEntity>("vanilla-add_entity");
+    // The capture keeps the largest `add_entity` body of the window, and that
+    // was a slime: 117 per Mojang's own `registries.json` for 1.21.11. This is
+    // the value a *real* server put on the wire, so it is the one worth
+    // asserting; the id this crate sends for a player is pinned separately.
+    assert_eq!(packet.entity_type, 117, "minecraft:slime");
+    assert_encoder_reproduces::<SpawnEntity>("vanilla-add_entity");
+}
+
+#[test]
+fn player_entity_type_matches_the_vanilla_registry() {
+    // `minecraft:player` is protocol id 155 in 1.21.11 (Mojang's
+    // `generated/reports/registries.json`, `minecraft:entity_type`). A spawn
+    // packet for another player carries that number, and the captured fixture
+    // above cannot show it because its body is a slime.
+    assert_eq!(ENTITY_TYPE_PLAYER, 155);
+    let spawn = SpawnEntity::player(1, uuid::Uuid::nil(), 0.5, 64.0, 0.5, 0.0, 0.0);
+    let mut writer = loadstone_protocol::PacketWriter::new();
+    spawn.encode(&mut writer);
+    let body = writer.as_slice();
+    // entity id (varint) + uuid (16) + type (varint) + 3 × f64 + 2 × u8 + ...
+    assert_eq!(&body[17..18], &[155], "the entity type follows the uuid");
+}
+
+#[test]
+fn entity_metadata_matches_the_captured_packet() {
+    // The body is carried as an opaque blob, so this only pins the entity id and
+    // the framing; the metadata *contents* are built in `loadstone-net` and are
+    // checked there against these same bytes.
+    let packet = decode_exactly::<EntityMetadata>("vanilla-set_entity_data");
+    assert!(packet.entity_id > 0);
+    assert!(packet.blob.len() > 2);
+    assert_encoder_reproduces::<EntityMetadata>("vanilla-set_entity_data");
+}
+
+#[test]
+fn player_info_update_matches_the_captured_packet() {
+    let packet = decode_exactly::<PlayerInfoUpdate>("vanilla-player_info_update");
+    assert!(!packet.entries.is_empty());
+    assert_encoder_reproduces::<PlayerInfoUpdate>("vanilla-player_info_update");
+}
+
+#[test]
+fn health_and_experience_match_the_captured_packets() {
+    decode_exactly::<UpdateHealth>("vanilla-set_health");
+    assert_encoder_reproduces::<UpdateHealth>("vanilla-set_health");
+    decode_exactly::<Experience>("vanilla-set_experience");
+    assert_encoder_reproduces::<Experience>("vanilla-set_experience");
+}
+
+#[test]
+fn time_and_abilities_match_the_captured_packets() {
+    decode_exactly::<UpdateTime>("vanilla-set_time");
+    assert_encoder_reproduces::<UpdateTime>("vanilla-set_time");
+    decode_exactly::<Abilities>("vanilla-player_abilities");
+    assert_encoder_reproduces::<Abilities>("vanilla-player_abilities");
+}
+
+#[test]
+fn chunk_batching_matches_the_captured_packets() {
+    decode_exactly::<ChunkBatchStart>("vanilla-chunk_batch_start");
+    assert_encoder_reproduces::<ChunkBatchStart>("vanilla-chunk_batch_start");
+    decode_exactly::<ChunkBatchFinished>("vanilla-chunk_batch_finished");
+    assert_encoder_reproduces::<ChunkBatchFinished>("vanilla-chunk_batch_finished");
+}
+
+#[test]
+fn entity_sync_and_removal_match_the_captured_packets() {
+    decode_exactly::<SyncEntityPosition>("vanilla-entity_position_sync");
+    assert_encoder_reproduces::<SyncEntityPosition>("vanilla-entity_position_sync");
+    decode_exactly::<RemoveEntities>("vanilla-remove_entities");
+    assert_encoder_reproduces::<RemoveEntities>("vanilla-remove_entities");
+}
+
+#[test]
+fn server_data_and_bundles_match_the_captured_packets() {
+    decode_exactly::<ServerData>("vanilla-server_data");
+    assert_encoder_reproduces::<ServerData>("vanilla-server_data");
+    decode_exactly::<BundleDelimiter>("vanilla-bundle_delimiter");
+    assert_encoder_reproduces::<BundleDelimiter>("vanilla-bundle_delimiter");
 }

@@ -349,6 +349,20 @@ impl Client {
                 id if id == ChunkBatchFinished::ID => {
                     batch =
                         Some(ChunkBatchFinished::decode(&mut PacketReader::new(&body)).unwrap());
+                    // A vanilla client measures the batch and only then sends
+                    // its receipt, so this is the one and only place a real
+                    // client acknowledges. Acking any earlier hides a server
+                    // that waits for the receipt before closing the batch.
+                    if !ack_sent {
+                        let mut writer = loadstone_protocol::PacketWriter::new();
+                        ChunkBatchReceived {
+                            chunks_per_tick: 10.0,
+                        }
+                        .encode(&mut writer);
+                        self.send_packet(ChunkBatchReceived::ID, writer.as_slice())
+                            .await;
+                        ack_sent = true;
+                    }
                 }
                 id if id == ClientPosition::ID => {
                     position = Some(ClientPosition::decode(&mut PacketReader::new(&body)).unwrap());
@@ -389,17 +403,6 @@ impl Client {
                         .await;
                 }
                 other => panic!("unexpected play packet {other:#x}"),
-            }
-
-            if !ack_sent && chunks.len() >= 9 {
-                let mut writer = loadstone_protocol::PacketWriter::new();
-                ChunkBatchReceived {
-                    chunks_per_tick: 10.0,
-                }
-                .encode(&mut writer);
-                self.send_packet(ChunkBatchReceived::ID, writer.as_slice())
-                    .await;
-                ack_sent = true;
             }
         }
 

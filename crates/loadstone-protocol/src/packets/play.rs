@@ -39,6 +39,17 @@ fn read_byte_array(reader: &mut PacketReader<'_>) -> Result<Vec<u8>, ProtocolErr
     reader.read_bytes(len as usize).map(ToOwned::to_owned)
 }
 
+/// Reads one anonymous NBT text component and returns its raw bytes.
+///
+/// A component is variable length and is often followed by more fields, so it
+/// must not be read as "everything that is left".
+fn read_component(reader: &mut PacketReader<'_>) -> Result<Vec<u8>, ProtocolError> {
+    reader
+        .read_anonymous_nbt()?
+        .map(ToOwned::to_owned)
+        .ok_or(ProtocolError::InvalidEnum(0))
+}
+
 // ── Clientbound ────────────────────────────────────────────────────────────
 
 /// S->C Login (id 0x30).
@@ -558,8 +569,40 @@ pub const PLAYER_INFO_UPDATE_GAME_MODE: u8 = 0x04;
 pub const PLAYER_INFO_UPDATE_LISTED: u8 = 0x08;
 pub const PLAYER_INFO_UPDATE_LATENCY: u8 = 0x10;
 pub const PLAYER_INFO_UPDATE_DISPLAY_NAME: u8 = 0x20;
-pub const PLAYER_INFO_UPDATE_HAT: u8 = 0x40;
-pub const PLAYER_INFO_UPDATE_LIST_ORDER: u8 = 0x80;
+pub const PLAYER_INFO_UPDATE_LIST_ORDER: u8 = 0x40;
+pub const PLAYER_INFO_UPDATE_HAT: u8 = 0x80;
+
+/// The payload of the `initialize_chat` action. The action bit is set whenever
+/// a payload is present, because vanilla always writes the "no session" form
+/// for tab-list entries of players without a chat session.
+#[derive(Debug, Clone, PartialEq)]
+pub enum InitializeChat {
+    /// Set, but this player has no chat session (the usual case).
+    NoSession,
+    /// Set, with the session that follows.
+    Session(ChatSession),
+}
+
+/// A chat session key, as sent by clients in the Login state and mirrored here
+/// in the tab list.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChatSession {
+    pub session_id: Uuid,
+    pub expires_at_millis: i64,
+    pub public_key: Vec<u8>,
+    pub public_key_signature: Vec<u8>,
+}
+
+/// The payload of the `display_name` action. As with [`InitializeChat`], the
+/// action can be set with no name at all, and vanilla does exactly that when it
+/// sets every bit.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DisplayName {
+    /// Set, but this player has no display name.
+    Absent,
+    /// Set, with the component that follows.
+    Present(Vec<u8>),
+}
 
 /// One tab list entry. `None` fields contribute no bytes on the wire unless the
 /// corresponding action bit is derived as set.
@@ -568,10 +611,11 @@ pub struct PlayerInfoEntry {
     pub uuid: Uuid,
     pub name: String,
     pub properties: Vec<(String, String, Option<String>)>,
+    pub initialize_chat: Option<InitializeChat>,
     pub gamemode: Option<i32>,
     pub listed: Option<i32>,
     pub latency: Option<i32>,
-    pub display_name: Option<Vec<u8>>,
+    pub display_name: Option<DisplayName>,
     pub list_priority: Option<i32>,
     pub show_hat: Option<bool>,
 }
@@ -579,6 +623,9 @@ pub struct PlayerInfoEntry {
 impl PlayerInfoEntry {
     fn actions(&self) -> u8 {
         let mut actions = PLAYER_INFO_ADD_PLAYER;
+        if self.initialize_chat.is_some() {
+            actions |= PLAYER_INFO_INITIALIZE_CHAT;
+        }
         if self.gamemode.is_some() {
             actions |= PLAYER_INFO_UPDATE_GAME_MODE;
         }
@@ -631,6 +678,22 @@ impl Packet for PlayerInfoUpdate {
                     }
                 }
             }
+            if of(entry) & PLAYER_INFO_INITIALIZE_CHAT != 0 {
+                match &entry.initialize_chat {
+                    Some(InitializeChat::Session(session)) => {
+                        out.write_bool(true);
+                        out.write_uuid(session.session_id);
+                        out.write_i64(session.expires_at_millis);
+                        write_byte_array(out, &session.public_key);
+                        write_byte_array(out, &session.public_key_signature);
+                    }
+                    // `None` here cannot happen: the bit is only set when a
+                    // payload is present, and `NoSession` is that payload.
+                    Some(InitializeChat::NoSession) | None => {
+                        out.write_bool(false);
+                    }
+                }
+            }
             if of(entry) & PLAYER_INFO_UPDATE_GAME_MODE != 0 {
                 out.write_varint(entry.gamemode.unwrap_or(0));
             }
@@ -642,10 +705,10 @@ impl Packet for PlayerInfoUpdate {
             }
             if of(entry) & PLAYER_INFO_UPDATE_DISPLAY_NAME != 0 {
                 match &entry.display_name {
-                    Some(nbt) => {
+                    Some(DisplayName::Present(nbt)) => {
                         out.write_bool(true).write_bytes(nbt);
                     }
-                    None => {
+                    Some(DisplayName::Absent) | None => {
                         out.write_bool(false);
                     }
                 }
@@ -687,6 +750,20 @@ impl Packet for PlayerInfoUpdate {
                     properties.push((pname, value, signature));
                 }
             }
+            let initialize_chat = if actions & PLAYER_INFO_INITIALIZE_CHAT != 0 {
+                if reader.read_bool()? {
+                    Some(InitializeChat::Session(ChatSession {
+                        session_id: reader.read_uuid()?,
+                        expires_at_millis: reader.read_i64()?,
+                        public_key: read_byte_array(reader)?,
+                        public_key_signature: read_byte_array(reader)?,
+                    }))
+                } else {
+                    Some(InitializeChat::NoSession)
+                }
+            } else {
+                None
+            };
             let gamemode = if actions & PLAYER_INFO_UPDATE_GAME_MODE != 0 {
                 Some(reader.read_varint()?)
             } else {
@@ -704,9 +781,11 @@ impl Packet for PlayerInfoUpdate {
             };
             let display_name = if actions & PLAYER_INFO_UPDATE_DISPLAY_NAME != 0 {
                 if reader.read_bool()? {
-                    Some(reader.read_rest().to_vec())
+                    // Only the component itself may be consumed here: the
+                    // list-order and hat fields can follow it.
+                    Some(DisplayName::Present(read_component(reader)?))
                 } else {
-                    None
+                    Some(DisplayName::Absent)
                 }
             } else {
                 None
@@ -725,6 +804,7 @@ impl Packet for PlayerInfoUpdate {
                 uuid,
                 name,
                 properties,
+                initialize_chat,
                 gamemode,
                 listed,
                 latency,
@@ -867,12 +947,15 @@ impl Packet for ServerData {
     }
 
     fn decode(reader: &mut PacketReader<'_>) -> Result<Self, ProtocolError> {
-        // The motd is a native NBT value, so the whole remaining buffer is the
-        // component; the icon (if present) follows it as an opaque option.
-        Ok(Self {
-            motd: reader.read_rest().to_vec(),
-            icon: None,
-        })
+        // The component is variable length and the icon flag follows it, so the
+        // component has to be parsed rather than assumed to own the tail.
+        let motd = read_component(reader)?;
+        let icon = if reader.read_bool()? {
+            Some(read_byte_array(reader)?)
+        } else {
+            None
+        };
+        Ok(Self { motd, icon })
     }
 }
 

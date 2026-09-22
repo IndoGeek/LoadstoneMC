@@ -7,13 +7,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use loadstone_protocol::packets::play::{
     degree_to_angle, pack_position, unpack_position, Abilities, BlockChange, BlockDig, BlockPlace,
-    BundleDelimiter, ChatMessage, ChunkBatchFinished, ChunkBatchReceived, ChunkBatchStart,
-    ClientPosition, EntityHeadRotation, EntityLook, EntityMetadata, Experience, MapChunk,
-    MovementFlags, PingRequest, PlayKeepAlive, PlayKeepAliveResponse, PlayLogin, PlayPong,
-    PlayPongResponse, PlayerInfoEntry, PlayerInfoUpdate, PlayerLook, PlayerPosition,
-    PlayerPositionLook, PlayerRemove, RemoveEntities, SetChunkCacheCenter, SpawnEntity, SpawnInfo,
-    SpawnPosition, SyncEntityPosition, SystemChat, TeleportConfirm, UnloadChunk, UpdateHealth,
-    UpdateTime,
+    BundleDelimiter, ChatMessage, ChunkBatchFinished, ChunkBatchStart, ClientPosition,
+    EntityHeadRotation, EntityLook, EntityMetadata, Experience, MapChunk, MovementFlags,
+    PingRequest, PlayKeepAlive, PlayKeepAliveResponse, PlayLogin, PlayPong, PlayPongResponse,
+    PlayerInfoEntry, PlayerInfoUpdate, PlayerLook, PlayerPosition, PlayerPositionLook,
+    PlayerRemove, RemoveEntities, SetChunkCacheCenter, SpawnEntity, SpawnInfo, SpawnPosition,
+    SyncEntityPosition, SystemChat, TeleportConfirm, UnloadChunk, UpdateHealth, UpdateTime,
 };
 use loadstone_protocol::Nbt;
 use loadstone_protocol::{Packet, PacketReader, PacketWriter};
@@ -261,14 +260,9 @@ async fn run_play(
     for body in &initial_bodies {
         conn.write_packet(MapChunk::ID, body).await?;
     }
-    // The client acknowledges the batch; the finished packet lifts the tunnel.
-    loop {
-        let frame = conn.read_packet().await?;
-        if frame.id == ChunkBatchReceived::ID {
-            let _ = ChunkBatchReceived::decode(&mut PacketReader::new(&frame.body))?;
-            break;
-        }
-    }
+    // The batch is closed immediately: a client sends `chunk_batch_received`
+    // *in response to* `chunk_batch_finished`, so waiting for it here would
+    // deadlock against a real client (and leave it on "Loading terrain").
     let body = encode_body(&ChunkBatchFinished {
         batch_size: initial.len() as i32,
     });
@@ -363,6 +357,9 @@ fn player_info_add(uuid: Uuid, name: &str) -> PlayerInfoUpdate {
             uuid,
             name: name.to_string(),
             properties: Vec::new(),
+            // Vanilla sets the initialize_chat action to "no session" for
+            // every tab-list entry; the client does not require it.
+            initialize_chat: None,
             gamemode: Some(0),
             listed: Some(1),
             latency: Some(0),

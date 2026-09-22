@@ -384,9 +384,12 @@ def drive_into_play(client: Client, name: str, expected_entity_id: int | None = 
     chunks = 0
     login = position = health = welcome = None
     acked = False
+    batch_finished = False
     surfaces = {}
     mob_spawns = {}
-    while chunks < 9 or None in (login, position, health, welcome):
+    # The batch has to be seen closed too: a server that waits for the receipt
+    # before closing it would otherwise never be reached by this loop.
+    while chunks < 9 or not batch_finished or None in (login, position, health, welcome):
         packet_id, body = client.read_packet()
         if packet_id == PKT_PLAY_LOGIN:
             login = body
@@ -402,6 +405,13 @@ def drive_into_play(client: Client, name: str, expected_entity_id: int | None = 
                 mob_spawns[entity_id] = entity_type
         elif packet_id == PKT_PLAY_CHUNK_BATCH_START:
             pass
+        elif packet_id == PKT_PLAY_CHUNK_BATCH_FINISHED:
+            # A vanilla client measures the closed batch and only then sends its
+            # receipt, so this is the one place a real client acknowledges.
+            batch_finished = True
+            if not acked:
+                client.write_packet(PKT_PLAY_CHUNK_BATCH_RECEIVED, struct.pack("<f", 10.0))
+                acked = True
         elif packet_id == PKT_PLAY_POSITION:
             position = body
             client.write_packet(PKT_PLAY_TELEPORT_CONFIRM, b"\x00")
@@ -414,14 +424,11 @@ def drive_into_play(client: Client, name: str, expected_entity_id: int | None = 
         elif packet_id == PKT_PLAY_DISCONNECT:
             check(False, "server does not disconnect during play", repr(body[:80]))
             raise AssertionError("kicked in play")
-        # Spawn position, tab list, abilities, experience, time, server data,
-        # chunk-batch finished: acknowledged silently.
-
-        if chunks >= 9 and not acked:
-            client.write_packet(PKT_PLAY_CHUNK_BATCH_RECEIVED, struct.pack("<f", 10.0))
-            acked = True
+        # Spawn position, tab list, abilities, experience, time and server data
+        # need no reply.
 
     check(chunks == 9, "the client receives a 3x3 chunk batch", f"{chunks} chunks")
+    check(batch_finished, "the server closes the chunk batch without waiting for the receipt")
 
     (entity_id,) = struct.unpack(">i", login[:4])
     if expected_entity_id is not None:

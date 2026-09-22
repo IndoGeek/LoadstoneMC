@@ -349,6 +349,25 @@ is non-zero if anything fails, so it can gate a release.
 - Chunk batches use `chunk_batch_start` id `0x0C` and `chunk_batch_finished` id
   `0x0B` (the latter carries a VarInt batch size, not a float). Note the finish
   id is lower than the start id, and `unload_chunk` sends chunk Z before chunk X.
+- **`chunk_batch_received` answers `chunk_batch_finished`, and never precedes
+  it.** The client measures the batch and sends its receipt only once the batch
+  is closed, so a server that waits for the receipt before sending the finish
+  packet deadlocks against a real client, which sits on "Loading terrain" until
+  it times out. Both test clients used to acknowledge after the ninth chunk,
+  which is exactly what the server waited for, so neither could see it; they now
+  acknowledge on `chunk_batch_finished` and the live check asserts it.
+- **Tab-list action bits are ordered, and a set bit can still carry nothing.**
+  The order is add-player, initialize-chat, game-mode, listed, latency,
+  display-name, list-order, hat (`0x01`…`0x80`), and vanilla sets every bit of a
+  mask with the "present but empty" form for the optional fields (a `false` flag
+  for the chat session and the display name). A model that treats "bit clear" and
+  "bit set, payload absent" as the same state re-encodes such a packet one byte
+  short per field.
+- **A text component owns only its own bytes.** Components such as the tab-list
+  display name, the server-data MOTD and a system chat line are variable-length
+  anonymous NBT, and fields can follow them in the same packet. Reading "the rest
+  of the packet" as the component swallows whatever follows it; parse the tag and
+  take its length instead.
 - Encryption is RSA-1024 with PKCS#1 v1.5 for the key exchange, then
   AES-128/CFB8 over the whole stream with the shared secret as both key and IV,
   exactly as Java's `AES/CFB8/NoPadding` does.
