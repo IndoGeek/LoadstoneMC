@@ -1373,14 +1373,18 @@ impl Packet for BundleDelimiter {
 
 // ── Serverbound ────────────────────────────────────────────────────────────
 
-/// C->S Keep Alive (id 0x19).
+/// C->S Keep Alive (id 0x1b).
+///
+/// `0x19` is `minecraft:interact`, not this packet; Mojang's packet report for
+/// 1.21.11 puts serverbound `keep_alive` at `0x1b`, so an id of `0x19` silently
+/// mis-reads a client's punch as a keep-alive reply and never sees the real one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlayKeepAliveResponse {
     pub keep_alive_id: i64,
 }
 
 impl Packet for PlayKeepAliveResponse {
-    const ID: i32 = 0x19;
+    const ID: i32 = 0x1b;
 
     fn encode(&self, out: &mut PacketWriter) {
         out.write_i64(self.keep_alive_id);

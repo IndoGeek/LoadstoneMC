@@ -213,6 +213,16 @@ impl Connection {
     }
 
     pub(crate) async fn write_packet(&mut self, id: i32, body: &[u8]) -> Result<(), NetError> {
+        // Every clientbound packet is logged with the exact length written into
+        // its frame, and small ones with their bytes. A client that rejects a
+        // packet says how many bytes it found extra, and this is the line that
+        // shows whether the frame really carried them, so a wire bug can be told
+        // apart from a layout bug from the log alone.
+        if body.len() <= 64 {
+            debug!(id, len = body.len(), hex = %hex(body), "clientbound packet");
+        } else {
+            debug!(id, len = body.len(), "clientbound packet");
+        }
         write_frame(&mut self.transport, id, body, self.compression_threshold).await?;
         Ok(())
     }
@@ -667,6 +677,19 @@ async fn configuration_phase(
 }
 
 /// The `minecraft:brand` payload is a single length-prefixed string.
+/// Lower-case hex, for packet traces.
+fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(bytes.len() * 3);
+    for (index, byte) in bytes.iter().enumerate() {
+        if index > 0 {
+            out.push(' ');
+        }
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
 fn encode_brand(brand: &str) -> Vec<u8> {
     let mut writer = PacketWriter::new();
     writer.write_string(brand);
